@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/nax-core", "crates/nax-cli", "app/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Claude Opus 5.5"]
+
+[workspace.dependencies]
+nax-core = { path = "crates/nax-core" }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

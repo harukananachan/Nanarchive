@@ -1,0 +1,15 @@
+[package]
+name = "nax-cli"
+description = "Nanarchive command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "nax"
+path = "src/main.rs"
+
+[dependencies]
+nax-core.workspace = true
+clap.workspace = true

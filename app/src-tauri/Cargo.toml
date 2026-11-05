@@ -1,0 +1,22 @@
+[package]
+name = "nax-app"
+description = "Nanarchive desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The `_lib` suffix avoids a name clash between the lib and the bin on Windows.
+name = "nax_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+nax-core.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

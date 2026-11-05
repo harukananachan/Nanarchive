@@ -1,0 +1,13 @@
+/target/
+node_modules/
+/app/dist/
+/app/build/
+/app/.svelte-kit/
+/app/src-tauri/target/
+/app/src-tauri/gen/
+/bench/corpus/
+/bench/results/
+*.nax
+*.x[0-9][0-9]
+.DS_Store
+Thumbs.db
