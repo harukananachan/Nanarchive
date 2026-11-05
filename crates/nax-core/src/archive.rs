@@ -1,4 +1,4 @@
-//! Opening, listing, extracting and testing `.nax` archives.
+﻿//! Opening, listing, extracting and testing `.nax` archives.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -9,8 +9,9 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::codec;
+use crate::codec::{self, Partial};
 use crate::format::{self, BlockInfo, Entry, Footer, Index, FOOTER_LEN, HEADER_LEN};
+use crate::history::History;
 use crate::fsmeta::{self, ATTR_HIDDEN, ATTR_READONLY, ATTR_SYSTEM};
 use crate::preset::pick_threads;
 use crate::{paths, Error, Phase, Progress, Result, MAGIC};
@@ -64,6 +65,8 @@ pub struct Archive {
     path: PathBuf,
     index: Index,
     archive_size: u64,
+    /// Bytes of earlier data to keep while decoding (0 = blocks are independent).
+    hist_keep: u64,
 }
 
 struct Active {
@@ -121,7 +124,14 @@ impl Archive {
             return Err(Error::Corrupt("file list has wrong size".into()));
         }
         let index = Index::decode(&raw, HEADER_LEN, footer.index_offset)?;
-        Ok(Archive { path, index, archive_size: len })
+        let mut reach = 0u64;
+        let mut max_block = 0u64;
+        for b in &index.blocks {
+            reach = reach.max(codec::history_needed(&b.chain, b.unpacked_size as usize)?);
+            max_block = max_block.max(b.unpacked_size);
+        }
+        let hist_keep = if reach > 0 { reach + max_block } else { 0 };
+        Ok(Archive { path, index, archive_size: len, hist_keep })
     }
 
     pub fn path(&self) -> &Path {
@@ -287,7 +297,13 @@ impl Archive {
                 }
             }
         }
-        let needed: Vec<usize> = needed.into_iter().collect();
+        let mut needed: Vec<usize> = needed.into_iter().collect();
+        if self.hist_keep > 0 {
+            // Blocks refer to earlier ones: decode everything up to the last needed.
+            if let Some(&last) = needed.last() {
+                needed = (0..=last).collect();
+            }
+        }
 
         let mut report = Progress {
             phase,
@@ -388,7 +404,7 @@ impl Archive {
 
     fn finish(&self, a: Active, stats: &mut RunStats) -> Result<()> {
         let e = &self.index.entries[a.entry];
-        let ok = a.written == e.size && a.hasher.finalize().as_bytes() == &e.hash;
+        let ok = a.written == e.size && a.hasher.finalize().as_bytes()[..crate::format::FILE_HASH_LEN] == e.hash;
         if !ok {
             if let Some((path, w)) = a.out {
                 drop(w);
@@ -416,8 +432,8 @@ impl Archive {
         Ok(())
     }
 
-    /// Reads, verifies and decompresses one block.
-    fn read_block(&self, file: &mut File, b: usize) -> Result<Vec<u8>> {
+    /// Reads, verifies and (where possible) decompresses one block.
+    fn read_block(&self, file: &mut File, b: usize) -> Result<Partial> {
         let blk = &self.index.blocks[b];
         let io = |e| Error::file(&self.path, e);
         file.seek(SeekFrom::Start(blk.offset)).map_err(io)?;
@@ -426,7 +442,7 @@ impl Archive {
         if blake3::hash(&packed).as_bytes() != &blk.hash {
             return Err(Error::Corrupt(format!("block {b} checksum mismatch")));
         }
-        codec::decode(&blk.chain, packed, blk.unpacked_size as usize)
+        codec::decode_start(&blk.chain, packed, blk.unpacked_size as usize)
     }
 
     /// Decompresses `needed` blocks on `threads` threads and hands them to
@@ -436,17 +452,35 @@ impl Archive {
         needed: &[usize],
         threads: usize,
         cancel: Option<&AtomicBool>,
-        sink: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+        sink: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<()> {
         if needed.is_empty() {
             return Ok(());
         }
+        let blocks = &self.index.blocks;
+        let mut starts = Vec::with_capacity(blocks.len());
+        let mut acc = 0u64;
+        for b in blocks {
+            starts.push(acc);
+            acc += b.unpacked_size;
+        }
+        let mut hist = History::new(self.hist_keep);
+        let mut finish = |b: usize, part: Partial| -> Result<()> {
+            let blk = &blocks[b];
+            let data = codec::decode_finish(&blk.chain, part, &hist, starts[b], blk.unpacked_size as usize)?;
+            sink(b, &data)?;
+            if self.hist_keep > 0 {
+                hist.push(starts[b], Arc::new(data));
+            }
+            Ok(())
+        };
+
         let threads = threads.clamp(1, needed.len());
         let window = threads * 2;
         let next_job = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let gate = (Mutex::new(0usize), Condvar::new());
-        let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let (tx, rx) = mpsc::channel::<(usize, Result<Partial>)>();
 
         thread::scope(|s| {
             for _ in 0..threads {
@@ -496,7 +530,7 @@ impl Archive {
                         result = Err(Error::Cancelled);
                         break 'recv;
                     }
-                    if let Err(e) = r.and_then(|data| sink(needed[next], data)) {
+                    if let Err(e) = r.and_then(|part| finish(needed[next], part)) {
                         result = Err(e);
                         break 'recv;
                     }

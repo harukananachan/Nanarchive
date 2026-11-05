@@ -1,15 +1,19 @@
-//! On-disk structures of the `.nax` format. See docs/FORMAT.md.
+﻿//! On-disk structures of the `.nax` format. See docs/FORMAT.md.
 
 use crate::varint::{Dec, Enc};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 
 pub const HEADER_LEN: u64 = 16;
 pub const FOOTER_LEN: u64 = 64;
-const INDEX_VERSION: u64 = 1;
+const INDEX_VERSION: u64 = 2;
+/// Per-file check value: BLAKE3 of the contents, cut to 64 bits. (Blocks
+/// carry the full 256-bit hash; this only has to catch a wrong file.)
+pub const FILE_HASH_LEN: usize = 8;
 
 /// Codec step ids (see FORMAT.md).
 pub const STEP_ZSTD: u8 = 1;
 pub const STEP_LZMA2: u8 = 2;
+pub const STEP_LDM: u8 = 3;
 
 // Sanity limits so a malicious index can't make us allocate absurd amounts.
 const MAX_PATH_LEN: usize = 32 * 1024;
@@ -98,12 +102,17 @@ pub struct BlockInfo {
 impl BlockInfo {
     /// Short human name of the method, e.g. "zstd", "lzma2", "store".
     pub fn method_name(&self) -> &'static str {
-        match self.chain.last().map(|s| s.id) {
+        match self.chain.iter().rev().map(|s| s.id).find(|&id| id != STEP_LDM) {
             None => "store",
             Some(STEP_ZSTD) => "zstd",
             Some(STEP_LZMA2) => "lzma2",
             Some(_) => "unknown",
         }
+    }
+
+    /// True if the block uses long-range matches.
+    pub fn uses_long_range(&self) -> bool {
+        self.chain.iter().any(|s| s.id == STEP_LDM)
     }
 }
 
@@ -125,8 +134,8 @@ pub struct Entry {
     /// Windows file attributes (readonly, hidden, …).
     pub attributes: u32,
     pub stream_offset: u64,
-    /// BLAKE3 of the file contents (zero for folders).
-    pub hash: [u8; 32],
+    /// First bytes of the BLAKE3 of the file contents (zero for folders).
+    pub hash: [u8; FILE_HASH_LEN],
 }
 
 impl Entry {
@@ -160,25 +169,7 @@ impl Index {
             }
             e.raw(&b.hash);
         }
-        e.var(self.entries.len() as u64);
-        for en in &self.entries {
-            e.bytes(en.path.as_bytes());
-            e.u8(match en.kind {
-                EntryKind::File => 0,
-                EntryKind::Dir => 1,
-            });
-            e.u8(en.mtime_ns.is_some() as u8);
-            if let Some(t) = en.mtime_ns {
-                e.ivar(t);
-            }
-            e.var(u64::from(en.attributes));
-            if en.kind == EntryKind::File {
-                e.var(en.size);
-                e.var(en.stream_offset);
-                e.raw(&en.hash);
-            }
-        }
-        e.buf
+        self.encode_entries(&mut e);        e.buf
     }
 
     /// Decodes and validates an index. `data_start..data_end` is where the
@@ -229,49 +220,164 @@ impl Index {
             return Err(Error::Corrupt("blocks don't fill the data area".into()));
         }
 
-        let entry_count = d.len(raw.len() / 4, "entry count")?;
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let path = d.bytes(MAX_PATH_LEN, "path")?;
-            let path = std::str::from_utf8(path)
-                .map_err(|_| Error::Corrupt("path is not UTF-8".into()))?
-                .to_string();
-            let kind = match d.u8()? {
-                0 => EntryKind::File,
-                1 => EntryKind::Dir,
-                k => return Err(Error::Corrupt(format!("unknown entry kind {k}"))),
-            };
-            let flags = d.u8()?;
-            let mtime_ns = if flags & 1 != 0 { Some(d.ivar()?) } else { None };
-            let attributes = u32::try_from(d.var()?)
-                .map_err(|_| Error::Corrupt("bad attributes".into()))?;
-            let (size, stream_offset, hash) = if kind == EntryKind::File {
-                let size = d.var()?;
-                let off = d.var()?;
-                let hash = d.hash()?;
-                match off.checked_add(size) {
-                    Some(end) if end <= stream_len => {}
-                    _ => return Err(Error::Corrupt(format!("{path}: data range out of bounds"))),
-                }
-                (size, off, hash)
-            } else {
-                (0, 0, [0u8; 32])
-            };
-            entries.push(Entry {
-                path,
-                kind,
-                size,
-                mtime_ns,
-                attributes,
-                stream_offset,
-                hash,
-            });
-        }
-        if !d.is_empty() {
+        let entries = decode_entries(&mut d, raw.len(), stream_len)?;        if !d.is_empty() {
             return Err(Error::Corrupt("trailing bytes in index".into()));
         }
         Ok(Index { blocks, entries })
     }
+
+    /// Entries are stored column by column (folder ids, names, flags,
+    /// times, ...) with folders in a shared table and names front-coded:
+    /// similar values end up together and compress far better.
+    fn encode_entries(&self, e: &mut Enc) {
+        fn split(p: &str) -> (&str, &str) {
+            p.rsplit_once('/').unwrap_or(("", p))
+        }
+        let dirs: Vec<&str> = self
+            .entries
+            .iter()
+            .map(|en| split(&en.path).0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let dir_id: std::collections::HashMap<&str, usize> = dirs.iter().enumerate().map(|(i, d)| (*d, i)).collect();
+
+        e.var(dirs.len() as u64);
+        let mut prev: &[u8] = b"";
+        for d in &dirs {
+            front_code(e, prev, d.as_bytes());
+            prev = d.as_bytes();
+        }
+        e.var(self.entries.len() as u64);
+        for en in &self.entries {
+            e.var(dir_id[split(&en.path).0] as u64);
+        }
+        let mut prev: &[u8] = b"";
+        for en in &self.entries {
+            let name = split(&en.path).1.as_bytes();
+            front_code(e, prev, name);
+            prev = name;
+        }
+        for en in &self.entries {
+            e.u8(u8::from(en.kind == EntryKind::Dir) | (u8::from(en.mtime_ns.is_some()) << 1));
+        }
+        let mut prev_t = 0i64;
+        for t in self.entries.iter().filter_map(|en| en.mtime_ns) {
+            e.ivar(t.wrapping_sub(prev_t));
+            prev_t = t;
+        }
+        for en in &self.entries {
+            e.var(u64::from(en.attributes));
+        }
+        let files = || self.entries.iter().filter(|en| en.kind == EntryKind::File);
+        for en in files() {
+            e.var(en.size);
+        }
+        let mut end = 0u64;
+        for en in files() {
+            e.ivar(en.stream_offset.wrapping_sub(end) as i64);
+            end = en.stream_offset.wrapping_add(en.size);
+        }
+        for en in files() {
+            e.raw(&en.hash);
+        }
+    }
+}
+
+/// Writes `cur` as (length shared with `prev`, rest).
+fn front_code(e: &mut Enc, prev: &[u8], cur: &[u8]) {
+    let common = prev.iter().zip(cur).take_while(|(a, b)| a == b).count();
+    e.var(common as u64);
+    e.bytes(&cur[common..]);
+}
+
+fn front_decode(d: &mut Dec, prev: &[u8], what: &str) -> Result<Vec<u8>> {
+    let common = d.len(prev.len(), what)?;
+    let rest = d.bytes(MAX_PATH_LEN, what)?;
+    if common + rest.len() > MAX_PATH_LEN {
+        return Err(Error::Corrupt(format!("{what} too long")));
+    }
+    let mut v = prev[..common].to_vec();
+    v.extend_from_slice(rest);
+    Ok(v)
+}
+
+fn decode_entries(d: &mut Dec, raw_len: usize, stream_len: u64) -> Result<Vec<Entry>> {
+    let utf8 = |v: Vec<u8>| String::from_utf8(v).map_err(|_| Error::Corrupt("path is not UTF-8".into()));
+    // Each folder needs at least 2 bytes, each entry at least 5: caps
+    // allocations by the real index size.
+    let dir_count = d.len(raw_len / 2, "folder count")?;
+    let mut dirs = Vec::with_capacity(dir_count);
+    let mut prev = Vec::new();
+    for _ in 0..dir_count {
+        let cur = front_decode(d, &prev, "folder name")?;
+        dirs.push(utf8(cur.clone())?);
+        prev = cur;
+    }
+    let count = d.len(raw_len / 5, "entry count")?;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(d.len(dir_count.saturating_sub(1), "folder id")?);
+    }
+    if count > 0 && dir_count == 0 {
+        return Err(Error::Corrupt("entries without folder table".into()));
+    }
+    let mut paths = Vec::with_capacity(count);
+    let mut prev = Vec::new();
+    for &id in &ids {
+        let name = front_decode(d, &prev, "file name")?;
+        let dir = &dirs[id];
+        let path = if dir.is_empty() {
+            utf8(name.clone())?
+        } else {
+            format!("{dir}/{}", utf8(name.clone())?)
+        };
+        if path.len() > MAX_PATH_LEN {
+            return Err(Error::Corrupt("path too long".into()));
+        }
+        paths.push(path);
+        prev = name;
+    }
+    let mut flags = Vec::with_capacity(count);
+    for _ in 0..count {
+        let f = d.u8()?;
+        if f > 3 {
+            return Err(Error::Corrupt(format!("unknown entry flags {f}")));
+        }
+        flags.push(f);
+    }
+    let mut times = Vec::with_capacity(count);
+    let mut t = 0i64;
+    for &f in &flags {
+        times.push(if f & 2 != 0 {
+            t = t.wrapping_add(d.ivar()?);
+            Some(t)
+        } else {
+            None
+        });
+    }
+    let mut entries = Vec::with_capacity(count);
+    for ((path, f), mtime_ns) in paths.into_iter().zip(&flags).zip(times) {
+        let attributes = u32::try_from(d.var()?).map_err(|_| Error::Corrupt("bad attributes".into()))?;
+        let kind = if f & 1 != 0 { EntryKind::Dir } else { EntryKind::File };
+        entries.push(Entry { path, kind, size: 0, mtime_ns, attributes, stream_offset: 0, hash: [0; FILE_HASH_LEN] });
+    }
+    let is_file = |en: &&mut Entry| en.kind == EntryKind::File;
+    for en in entries.iter_mut().filter(is_file) {
+        en.size = d.var()?;
+    }
+    let mut end = 0u64;
+    for en in entries.iter_mut().filter(is_file) {
+        en.stream_offset = end.wrapping_add(d.ivar()? as u64);
+        match en.stream_offset.checked_add(en.size) {
+            Some(e) if e <= stream_len => end = e,
+            _ => return Err(Error::Corrupt(format!("{}: data range out of bounds", en.path))),
+        }
+    }
+    for en in entries.iter_mut().filter(is_file) {
+        en.hash = d.raw(FILE_HASH_LEN)?.try_into().unwrap();
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -304,7 +410,7 @@ mod tests {
                     mtime_ns: Some(-5),
                     attributes: 16,
                     stream_offset: 0,
-                    hash: [0; 32],
+                    hash: [0; FILE_HASH_LEN],
                 },
                 Entry {
                     path: "dir/файл.txt".into(),
@@ -313,7 +419,7 @@ mod tests {
                     mtime_ns: None,
                     attributes: 32,
                     stream_offset: 0,
-                    hash: [3; 32],
+                    hash: [3; FILE_HASH_LEN],
                 },
             ],
         }

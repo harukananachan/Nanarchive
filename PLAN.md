@@ -1,4 +1,4 @@
-# Nanarchive — Master Plan
+﻿# Nanarchive — Master Plan
 
 > Nanarchive (nana + archive): an archiver that aims to compress smaller than 7-Zip / RAR / ZIP
 > and feel nicer to use — fast, light, with a modern soft rounded UI.
@@ -122,6 +122,8 @@ CLI: `nar a`, `nar x`, `nar l`, `nar t` (add / extract / list / test).
 A test corpus (photos, docs, source code, exes, game assets, PNGs, logs, mixed folder)
 and a script comparing Nanarchive vs ZIP / 7z / RAR on size + speed.
 ✅ Done when: one command prints a comparison table. Every later phase is measured here.
+✅ **Done.** `python -I bench\bench.py`. The engine was also rebuilt for speed: parallel LZMA2 blocks sized to the CPU count, a long-range matcher across blocks, a small preset dictionary, the x86 filter for .exe/.dll, parallel file reading and a compact index.
+Result (Balanced vs WinRAR Best): smaller on code-js, code-rust, docs-html and programs, and faster on code-js, code-rust and docs-html. Still 0.4 s slower on programs and 0.5% bigger on JPEGs (Phase 3: JPEG recompression). Max/Ultra don't beat 7z Ultra on size yet except code-js (Phase 3 + 6).
 
 **Phase 3 — The "beat 7z" features**
 Executable filters, file-type detection & sorting, Lepton JPEG, preflate (PNG/ZIP/DOCX/PDF), dedup.

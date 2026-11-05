@@ -1,4 +1,4 @@
-//! What each preset means in terms of codec, block size and memory.
+﻿//! What each preset means in terms of codec, block size and memory.
 
 use std::fmt;
 
@@ -14,12 +14,12 @@ pub enum Preset {
     Store,
     /// zstd, fast.
     Fast,
-    /// zstd high with a long window. Default.
+    /// Parallel LZMA2 + long-range matching. Default.
     #[default]
     Balanced,
-    /// LZMA2, big dictionary.
+    /// Like Balanced with bigger blocks and preset dictionaries.
     Max,
-    /// LZMA2 extreme. Context mixing arrives in Phase 6.
+    /// LZMA2 extreme with big preset dictionaries. Context mixing arrives in Phase 6.
     Ultra,
 }
 
@@ -28,6 +28,8 @@ pub(crate) struct Params {
     pub block_size: usize,
     /// Rough memory one compression thread needs (buffers + encoder).
     pub mem_per_thread: u64,
+    /// Long-range matcher window (log2 bytes), if enabled.
+    pub ldm_window_log: Option<u8>,
 }
 
 impl Preset {
@@ -50,35 +52,45 @@ impl Preset {
     }
 
     pub(crate) fn params(self) -> Params {
+        // Layouts chosen with the codec lab (crates/nax-core/examples/lab.rs):
+        // many small LZMA2 blocks keep every core busy, the long-range matcher
+        // recovers repeats across blocks, and Max/Ultra give each block a
+        // preset dictionary of the data just before it.
         let mb = |n: usize| (n * MIB) as u64;
         match self {
             Preset::Store => Params {
                 method: Method::Store,
                 block_size: 16 * MIB,
                 mem_per_thread: mb(40),
+                ldm_window_log: None,
             },
             Preset::Fast => Params {
                 method: Method::Zstd { level: 3, window_log: 23, long: false },
                 block_size: 16 * MIB,
                 mem_per_thread: mb(80),
+                ldm_window_log: None,
             },
             Preset::Balanced => Params {
-                method: Method::Zstd { level: 19, window_log: 26, long: true },
-                block_size: 64 * MIB,
-                mem_per_thread: mb(450),
+                method: Method::Lzma2 { preset: 9, dict_size: 8 << 20, prefix: MIB },
+                block_size: 4 * MIB,
+                mem_per_thread: mb(110),
+                ldm_window_log: Some(28),
             },
             Preset::Max => Params {
-                method: Method::Lzma2 { preset: 9, dict_size: 64 << 20 },
-                block_size: 128 * MIB,
-                mem_per_thread: mb(1000),
+                method: Method::Lzma2 { preset: 9, dict_size: 24 << 20, prefix: 8 * MIB },
+                block_size: 8 * MIB,
+                mem_per_thread: mb(330),
+                ldm_window_log: Some(28),
             },
             Preset::Ultra => Params {
                 method: Method::Lzma2 {
-                    preset: 9 | liblzma::stream::PRESET_EXTREME,
-                    dict_size: 128 << 20,
+                    preset: 9 | crate::codec::LZMA_EXTREME,
+                    dict_size: 64 << 20,
+                    prefix: 48 * MIB,
                 },
-                block_size: 256 * MIB,
-                mem_per_thread: mb(2000),
+                block_size: 16 * MIB,
+                mem_per_thread: mb(800),
+                ldm_window_log: Some(30),
             },
         }
     }

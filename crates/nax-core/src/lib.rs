@@ -12,6 +12,8 @@ mod codec;
 mod create;
 pub mod format;
 pub mod fsmeta;
+mod history;
+mod ldm;
 pub mod paths;
 mod preset;
 mod varint;

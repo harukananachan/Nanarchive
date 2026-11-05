@@ -1,4 +1,4 @@
-# Nanarchive
+﻿# Nanarchive
 
 An archiver that aims to compress smaller than 7-Zip and WinRAR, with a fast, modern, soft rounded UI.
 Archive format: **`.nax`**. See [PLAN.md](PLAN.md) for the full plan and roadmap.
@@ -40,4 +40,5 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 
 - Phase 0 (setup) — done
 - Phase 1 (`.nax` format, engine, CLI) — done
-- Next: Phase 2 — benchmark against ZIP, 7-Zip and WinRAR
+- Phase 2 (benchmark + speed engine) — done; run `python -I bench\bench.py`, results in `bench/results/`
+- Next: Phase 3 — file-type filters, JPEG/PNG recompression, dedup

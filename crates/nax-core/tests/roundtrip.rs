@@ -120,6 +120,35 @@ fn round_trip_every_preset() {
 }
 
 #[test]
+fn long_range_matches_shrink_far_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("dup");
+    fs::create_dir_all(&root).unwrap();
+    let noise = random_bytes(3_000_000, 42);
+    fs::write(root.join("a.bin"), &noise).unwrap();
+    fs::write(root.join("b.txt"), text(40_000)).unwrap(); // something in between
+    fs::write(root.join("c.bin"), &noise).unwrap();
+
+    for preset in [Preset::Balanced, Preset::Max] {
+        let archive = tmp.path().join(format!("dup-{preset}.nax"));
+        let s = create(&archive, &[root.clone()], &opts(preset), &mut noop).unwrap();
+        let a = Archive::open(&archive).unwrap();
+        assert!(a.blocks().iter().any(|b| b.uses_long_range()), "{preset}");
+        // Random data can't compress, so the second copy must be (nearly) free.
+        assert!(s.archive_size < 3_300_000, "{preset}: {}", s.archive_size);
+        let out = tmp.path().join(format!("out-{preset}"));
+        a.extract(&out, &ExtractOptions::default(), &mut noop).unwrap();
+        assert_eq!(fs::read(out.join("dup/c.bin")).unwrap(), noise);
+
+        // Extracting only the last file still works (needs earlier blocks).
+        let out2 = tmp.path().join(format!("out2-{preset}"));
+        let only = ExtractOptions { only: vec!["dup/c.bin".into()], ..Default::default() };
+        a.extract(&out2, &only, &mut noop).unwrap();
+        assert_eq!(fs::read(out2.join("dup/c.bin")).unwrap(), noise);
+    }
+}
+
+#[test]
 fn modification_times_are_restored() {
     let tmp = tempfile::tempdir().unwrap();
     let root = make_tree(tmp.path());
