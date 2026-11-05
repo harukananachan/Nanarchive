@@ -12,11 +12,15 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Nanarchive",
         "width": 1100,
         "height": 720,
-        "minWidth": 720,
-        "minHeight": 480
+        "minWidth": 760,
+        "minHeight": 520,
+        "decorations": false,
+        "shadow": true,
+        "center": true
       }
     ],
     "security": {

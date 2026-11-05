@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="strap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a48bff"/>
+      <stop offset="1" stop-color="#7d5ef0"/>
+    </linearGradient>
+    <linearGradient id="buckle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe29a"/>
+      <stop offset="1" stop-color="#ffc768"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#5b3fc4" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <!-- Book stack, scaled up a little to fill the transparent canvas -->
+  <g filter="url(#soft)" transform="translate(512 512) scale(1.12) translate(-512 -516)">
+    <!-- Bottom book: pink -->
+    <rect x="222" y="612" width="580" height="176" rx="52" fill="#ffb4c8"/>
+    <rect x="698" y="636" width="78" height="128" rx="26" fill="#fff8ef"/>
+    <rect x="276" y="612" width="26" height="176" fill="#f08faa" opacity="0.7"/>
+
+    <!-- Middle book: mint -->
+    <rect x="262" y="428" width="540" height="176" rx="52" fill="#9fe6cb"/>
+    <rect x="698" y="452" width="78" height="128" rx="26" fill="#fff8ef"/>
+    <rect x="316" y="428" width="26" height="176" fill="#6fcfab" opacity="0.7"/>
+
+    <!-- Top book: sky blue -->
+    <rect x="236" y="244" width="556" height="176" rx="52" fill="#aed3ff"/>
+    <rect x="688" y="268" width="78" height="128" rx="26" fill="#fff8ef"/>
+    <rect x="290" y="244" width="26" height="176" fill="#80b6f5" opacity="0.7"/>
+
+    <!-- Strap -->
+    <rect x="456" y="212" width="112" height="608" rx="44" fill="url(#strap)"/>
+
+    <!-- Buckle -->
+    <rect x="414" y="444" width="196" height="144" rx="48" fill="url(#buckle)"/>
+    <rect x="456" y="484" width="112" height="64" rx="24" fill="url(#strap)"/>
+  </g>
+</svg>

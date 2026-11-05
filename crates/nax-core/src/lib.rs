@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod archive;
 mod codec;
 mod create;
+mod estimate;
 pub mod format;
 pub mod fsmeta;
 mod history;
@@ -22,6 +23,7 @@ mod zipped;
 
 pub use archive::{Archive, ExtractOptions, ExtractStats, Overwrite, TestStats};
 pub use create::{create, CreateOptions, CreateStats};
+pub use estimate::{estimate, Estimate};
 pub use format::{BlockInfo, Entry, EntryKind};
 pub use preset::Preset;
 

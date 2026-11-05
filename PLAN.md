@@ -135,6 +135,15 @@ Balanced beats WinRAR Best on size on all 7 sets. Max beats 7z Ultra on 4 of 7 s
 **Phase 4 — UI (Tauri + Svelte)**
 All screens from section 5, themes, animations, progress events from the core.
 ✅ Done when: create / open / extract work fully from the UI and feel smooth.
+Layout (chosen by the user): WinRAR-style file manager, modernized — menu bar in the title bar
+(File / Commands / Options / Help), big soft toolbar (Add, Extract to, Test, View, Open, Find, Info,
+Settings) with pastel icons, address bar (type a path, or `archive.nax\folder`), one file list that
+browses disk folders and the inside of archives (".." goes up, out of the archive back to its folder),
+status bar. Dialogs: Add to archive (preset slider + live size estimate), Extract (destination,
+keep/replace), Archive information, Settings (theme, accent, labels, animations, default preset),
+preview of images/text inside an archive, progress ring with speed / time left / "saved X MB".
+Virtual list (100,000+ rows), drag & drop, right-click menu, keyboard shortcuts (Alt+A/E/T/V/I,
+Ctrl+O/F/A, F5, Backspace, Enter, type-to-jump). `npm run dev` in a plain browser uses mock data.
 
 **Phase 5 — Security & robustness**
 Encryption, recovery records, split volumes, fuzz testing the reader, path-safety checks.

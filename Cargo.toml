@@ -13,6 +13,13 @@ nax-core = { path = "crates/nax-core" }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
+# `tauri dev` builds in debug; keep the engine and its codecs fast there.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.nax-core]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "fat"
