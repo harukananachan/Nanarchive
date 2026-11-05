@@ -128,6 +128,9 @@ Result (Balanced vs WinRAR Best): smaller on code-js, code-rust, docs-html and p
 **Phase 3 — The "beat 7z" features**
 Executable filters, file-type detection & sorting, Lepton JPEG, preflate (PNG/ZIP/DOCX/PDF), dedup.
 ✅ Done when: Max preset beats 7z Ultra on the mixed corpus.
+✅ **Done** (results: `bench/results/20261105-211211-phase3.md`). Lossless JPEG recompression (Lepton), deflate recompression for PNG / ZIP / JAR / DOCX / GZ (preflate, verified by full decode), content sniffing, sort by (extension, path), whole-file dedup, x86 filter, parallel chunked LZMA2 for huge files, long-match search in Max.
+Result (MB, 7z Ultra → Nax Max / Nax Ultra): code-js 17.86 → **17.56 / 17.38**, code-rust 13.85 → 14.19 / **13.84**, docs 5.49 → 6.09 / 5.51, photos 45.58 → **36.31 / 36.29**, png 32.85 → **27.97 / 26.30**, programs 29.04 → 31.11 / 30.79, zips 34.00 → **26.22 / 25.59**.
+Balanced beats WinRAR Best on size on all 7 sets. Max beats 7z Ultra on 4 of 7 sets and is 2–4× faster. Remaining gaps (Max on code-rust, docs; both on programs, where 7z uses BCJ2) → Phase 6 (stronger model for Ultra, BCJ2-style exe filter).
 
 **Phase 4 — UI (Tauri + Svelte)**
 All screens from section 5, themes, animations, progress events from the core.

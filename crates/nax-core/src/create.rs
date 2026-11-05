@@ -97,6 +97,8 @@ struct Job {
     x86: bool,
     /// Whole files in the block that may be recompressed (JPEG…).
     segments: Vec<Segment>,
+    /// Bigger than the block size (holds one big file kept whole).
+    oversized: bool,
 }
 
 /// A filled read buffer.
@@ -105,6 +107,7 @@ struct Raw {
     /// How many of its bytes come from executables (files starting with "MZ").
     exe_bytes: usize,
     segments: Vec<Segment>,
+    oversized: bool,
 }
 
 /// Turns filled buffers into jobs: runs the long-range matcher and keeps
@@ -126,11 +129,12 @@ impl Blocker {
         // Recompressed blocks stand alone: no long-range matches or preset
         // dictionary (they would change the bytes the recompressor sees).
         let plain = raw.segments.is_empty();
-        let mut job = Job { no: self.no, orig: orig.clone(), ldm: None, prefix: Vec::new(), x86, segments: raw.segments };
+        let mut job = Job { no: self.no, orig: orig.clone(), ldm: None, prefix: Vec::new(), x86, segments: raw.segments, oversized: raw.oversized };
         if let Some(h) = &mut self.hist {
-            // Executables get the x86 filter instead: a preset dictionary
-            // costs time there and gains little.
-            if self.prefix > 0 && self.bstart > 0 && !x86 && plain {
+            // Executables get the x86 filter instead: in Balanced a preset
+            // dictionary costs time there and gains little.
+            let wants_prefix = !x86 || self.prefix >= 4 << 20;
+            if self.prefix > 0 && self.bstart > 0 && wants_prefix && plain {
                 let start = self.bstart.saturating_sub(self.prefix as u64);
                 job.prefix = h.copy_range(start, self.bstart).unwrap_or_default();
             }
@@ -217,15 +221,15 @@ fn create_inner(
     let mut warnings = Vec::new();
     let items = scan(inputs, &[archive, tmp], &mut warnings, cancel)?;
 
-    // Folders first, then files grouped by extension so similar data
-    // ends up next to each other in the solid stream.
+    // Folders first, then files grouped by extension, then by path (files
+    // of one folder tend to be alike), so similar data ends up together.
     let dir_ids: Vec<usize> = (0..items.len()).filter(|&i| items[i].kind == EntryKind::Dir).collect();
     let mut file_ids: Vec<usize> = (0..items.len()).filter(|&i| items[i].kind == EntryKind::File).collect();
     file_ids.sort_by_cached_key(|&i| {
         let name = &items[i].name;
         let file = name.rsplit('/').next().unwrap_or(name).to_lowercase();
         let ext = file.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_default();
-        (ext, file, name.clone())
+        (ext, name.to_lowercase())
     });
 
     let params = opts.preset.params();
@@ -234,7 +238,7 @@ fn create_inner(
         Some(b) => b.max(1),
         None => {
             let t = pick_threads(opts.threads, params.mem_per_thread, usize::MAX);
-            fit_block_size(bytes_total, params.block_size, t)
+            fit_block_size(bytes_total, params.block_size, t, params.shrink_blocks)
         }
     };
     let jobs = bytes_total.div_ceil(block_size as u64).max(1) as usize;
@@ -440,12 +444,14 @@ fn lower_priority() {
 
 /// Adjusts the preset's block size so the blocks split evenly over the
 /// threads: 31 blocks on 28 threads would leave 3 blocks running alone at
-/// the end. Stays within 1/4..1.5x of the preset's size.
-fn fit_block_size(total: u64, base: usize, threads: usize) -> usize {
+/// the end. Stays within 1/4..1.5x of the preset's size (1..1.5x without
+/// `shrink`).
+fn fit_block_size(total: u64, base: usize, threads: usize, shrink: bool) -> usize {
     let per_round = (threads.max(1) * base) as f64;
     let rounds = (total as f64 / per_round).round().max(1.0);
     let ideal = (total as f64 / (rounds * threads.max(1) as f64)).ceil() as usize;
-    let min = (base / 4).max(1 << 20).min(base);
+    // Max/Ultra keep at least their block size: there, ratio beats speed.
+    let min = if shrink { (base / 4).max(1 << 20).min(base) } else { base };
     ideal.clamp(min, base + base / 2)
 }
 
@@ -477,7 +483,7 @@ fn encode_block(method: &Method, window_log: Option<u8>, effort: recomp::Effort,
     let prefix = if method.prefix() > 0 { &job.prefix[..] } else { &[] };
     // A big file kept whole (an archive that couldn't be unpacked) makes an
     // oversized block: compress it on several threads.
-    let encoded = if prefix.is_empty() && !job.x86 && input.len() > 8 << 20 {
+    let encoded = if job.oversized && prefix.is_empty() && !job.x86 {
         codec::encode_chunked(method, input, 4 << 20)?
     } else {
         codec::encode(method, input, prefix, job.x86)?
@@ -522,7 +528,9 @@ fn encode_recompressed(method: &Method, effort: recomp::Effort, job: &Job) -> Re
         let m = Method::Lzma2 { preset, dict_size, prefix: 0 };
         // Unpacked PNG/ZIP data can be many times the block size: use
         // several threads so one block doesn't hold up the whole archive.
-        let chunk = (dict_size as usize).clamp(1 << 20, 4 << 20);
+        // Pieces of at least the block size: only the extra (unpacked) data
+        // gets split up, normal blocks stay one stream.
+        let chunk = (dict_size as usize).clamp(1 << 20, 4 << 20).max(job.orig.len());
         if let Some((step, out)) = codec::encode_chunked(&m, &packed, chunk)? {
             chain.push(step);
             packed = out;
@@ -690,7 +698,8 @@ impl Packer {
     fn send(&mut self) -> Result<()> {
         self.blocks += 1;
         let data = std::mem::replace(&mut self.buf, Vec::with_capacity(self.block_size));
-        let raw = Raw { data, exe_bytes: std::mem::take(&mut self.exe_bytes), segments: std::mem::take(&mut self.segments) };
+        let oversized = data.len() > self.block_size + self.block_size / 2;
+        let raw = Raw { data, exe_bytes: std::mem::take(&mut self.exe_bytes), segments: std::mem::take(&mut self.segments), oversized };
         self.tx.send(raw).map_err(|_| Error::Cancelled)
     }
 

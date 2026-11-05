@@ -33,6 +33,9 @@ impl Method {
 }
 
 pub(crate) const LZMA_EXTREME: u32 = 0x8000_0000;
+/// Our own preset flag: look for matches up to 273 bytes (LZMA's maximum)
+/// instead of 64. Helps text with long repeats (HTML, source code).
+pub(crate) const LONG_MATCHES: u32 = 0x4000_0000;
 /// LZMA2 props flag byte: x86 filter in front of LZMA2.
 const LZMA_FLAG_X86: u8 = 1;
 
@@ -51,9 +54,12 @@ mod lzma {
 
     use liblzma_sys as lz;
 
+    use super::LONG_MATCHES;
     use crate::{Error, Result};
 
     pub fn options(preset: u32, dict: u32, prefix: &[u8]) -> Result<lz::lzma_options_lzma> {
+        let preset_flags = preset;
+        let preset = preset & !LONG_MATCHES;
         // SAFETY: plain C struct; zeroed is a valid starting state and
         // lzma_lzma_preset fills it in.
         let mut o: lz::lzma_options_lzma = unsafe { std::mem::zeroed() };
@@ -61,6 +67,9 @@ mod lzma {
             return Err(Error::Codec("bad LZMA preset".into()));
         }
         o.dict_size = dict;
+        if preset_flags & LONG_MATCHES != 0 {
+            o.nice_len = 273;
+        }
         if !prefix.is_empty() {
             o.preset_dict = prefix.as_ptr();
             o.preset_dict_size = prefix.len() as u32;

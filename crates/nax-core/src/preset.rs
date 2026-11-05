@@ -36,6 +36,8 @@ pub(crate) struct Params {
     /// ...or unpacking to more than this many bytes (one stream is
     /// analyzed on one core at ~1-2 MB/s).
     pub max_plain: usize,
+    /// Blocks may get smaller than `block_size` to keep all cores busy.
+    pub shrink_blocks: bool,
 }
 
 impl Preset {
@@ -71,6 +73,7 @@ impl Preset {
                 ldm_window_log: None,
                 max_expand: 0,
                 max_plain: 0,
+                shrink_blocks: true,
             },
             Preset::Fast => Params {
                 method: Method::Zstd { level: 3, window_log: 23, long: false },
@@ -79,6 +82,7 @@ impl Preset {
                 ldm_window_log: None,
                 max_expand: 0,
                 max_plain: 0,
+                shrink_blocks: true,
             },
             Preset::Balanced => Params {
                 method: Method::Lzma2 { preset: 9, dict_size: 8 << 20, prefix: MIB },
@@ -87,14 +91,16 @@ impl Preset {
                 ldm_window_log: Some(28),
                 max_expand: 6,
                 max_plain: 3 * MIB,
+                shrink_blocks: true,
             },
             Preset::Max => Params {
-                method: Method::Lzma2 { preset: 9, dict_size: 24 << 20, prefix: 8 * MIB },
+                method: Method::Lzma2 { preset: 9 | crate::codec::LONG_MATCHES, dict_size: 24 << 20, prefix: 8 * MIB },
                 block_size: 8 * MIB,
                 mem_per_thread: mb(330),
                 ldm_window_log: Some(28),
                 max_expand: 32,
                 max_plain: 32 * MIB,
+                shrink_blocks: false,
             },
             Preset::Ultra => Params {
                 method: Method::Lzma2 {
@@ -107,6 +113,7 @@ impl Preset {
                 ldm_window_log: Some(30),
                 max_expand: 1000,
                 max_plain: 128 * MIB,
+                shrink_blocks: false,
             },
         }
     }

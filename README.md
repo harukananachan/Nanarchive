@@ -41,4 +41,5 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 - Phase 0 (setup) — done
 - Phase 1 (`.nax` format, engine, CLI) — done
 - Phase 2 (benchmark + speed engine) — done; run `python -I bench\bench.py`, results in `bench/results/`
-- Next: Phase 3 — file-type filters, JPEG/PNG recompression, dedup
+- Phase 3 (JPEG/PNG/ZIP recompression, dedup, file-type sorting, Max tuning) — done
+- Next: Phase 4 — the desktop app UI
