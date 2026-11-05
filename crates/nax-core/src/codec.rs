@@ -9,10 +9,10 @@
 
 use zstd::zstd_safe::{CParameter, DParameter};
 
-use crate::format::{Step, STEP_LDM, STEP_LZMA2, STEP_ZSTD};
+use crate::format::{Step, STEP_LDM, STEP_LZMA2, STEP_RECOMP, STEP_ZSTD};
 use crate::history::History;
 use crate::varint::{Dec, Enc};
-use crate::{ldm, Error, Result};
+use crate::{ldm, recomp, Error, Result};
 
 /// How to compress a block (encoder side).
 #[derive(Debug, Clone)]
@@ -213,6 +213,12 @@ fn looks_incompressible(data: &[u8]) -> bool {
     sample_ratio(data) >= 97
 }
 
+pub(crate) fn recomp_step(payload_len: usize) -> Step {
+    let mut e = Enc::default();
+    e.var(payload_len as u64);
+    Step { id: STEP_RECOMP, props: e.buf }
+}
+
 pub(crate) fn ldm_step(window_log: u8, payload_len: usize) -> Step {
     let mut e = Enc::default();
     e.u8(window_log);
@@ -224,6 +230,8 @@ pub(crate) fn ldm_step(window_log: u8, payload_len: usize) -> Step {
 struct Plan<'a> {
     /// (window, payload size) of the long-range step.
     ldm: Option<(u64, usize)>,
+    /// Payload size of the recompression step.
+    recomp: Option<usize>,
     codec: Option<&'a Step>,
     /// Output size of the codec step.
     codec_out: usize,
@@ -233,12 +241,26 @@ struct Plan<'a> {
 
 fn plan(chain: &[Step], size: usize) -> Result<Plan<'_>> {
     let bad = |m: &str| Error::Corrupt(m.to_string());
-    let (ldm_step, codec) = match chain {
-        [] => (None, None),
-        [a] if a.id == STEP_LDM => (Some(a), None),
-        [a] => (None, Some(a)),
-        [a, b] if a.id == STEP_LDM && b.id != STEP_LDM => (Some(a), Some(b)),
+    let is_codec = |s: &Step| s.id != STEP_LDM && s.id != STEP_RECOMP;
+    let (ldm_step, recomp_step, codec) = match chain {
+        [] => (None, None, None),
+        [a] if a.id == STEP_LDM => (Some(a), None, None),
+        [a] if a.id == STEP_RECOMP => (None, Some(a), None),
+        [a] => (None, None, Some(a)),
+        [a, b] if a.id == STEP_LDM && is_codec(b) => (Some(a), None, Some(b)),
+        [a, b] if a.id == STEP_RECOMP && is_codec(b) => (None, Some(a), Some(b)),
         _ => return Err(bad("unknown compression method (made by a newer Nanarchive?)")),
+    };
+    let recomp = match recomp_step {
+        Some(s) => {
+            let mut d = Dec::new(&s.props);
+            let len = d.len(1 << 31, "recompressed size")?;
+            if !d.is_empty() {
+                return Err(bad("bad recompression settings"));
+            }
+            Some(len)
+        }
+        None => None,
     };
     let ldm = match ldm_step {
         Some(s) => {
@@ -252,14 +274,14 @@ fn plan(chain: &[Step], size: usize) -> Result<Plan<'_>> {
         }
         None => None,
     };
-    let codec_out = ldm.map_or(size, |(_, len)| len);
+    let codec_out = ldm.map(|(_, len)| len).or(recomp).unwrap_or(size);
     let prefix = match codec {
         Some(s) if s.id == STEP_LZMA2 && s.props.len() >= 8 => {
             u32::from_le_bytes(s.props[4..8].try_into().unwrap()) as usize
         }
         _ => 0,
     };
-    Ok(Plan { ldm, codec, codec_out, prefix })
+    Ok(Plan { ldm, recomp, codec, codec_out, prefix })
 }
 
 /// How far back a block reaches into earlier data (0 = fully independent).
@@ -325,7 +347,16 @@ pub(crate) fn decode_start(chain: &[Step], packed: Vec<u8>, size: usize) -> Resu
     if p.prefix > 0 {
         return Ok(Partial::Packed(packed));
     }
-    Ok(Partial::Decoded(decode_codec(p.codec, packed, p.codec_out, &[])?))
+    let mid = decode_codec(p.codec, packed, p.codec_out, &[])?;
+    Ok(Partial::Decoded(undo_recomp(&p, mid, size)?))
+}
+
+/// Rebuilds recompressed files (no-op for other blocks).
+fn undo_recomp(p: &Plan, mid: Vec<u8>, size: usize) -> Result<Vec<u8>> {
+    match p.recomp {
+        Some(_) => recomp::decode(&mid, size),
+        None => Ok(mid),
+    }
 }
 
 /// Finishes decoding in stream order, using `hist` (data before `bstart`).
@@ -340,7 +371,7 @@ pub(crate) fn decode_finish(chain: &[Step], part: Partial, hist: &History, bstar
             let prefix = hist
                 .copy_range(start, bstart)
                 .ok_or_else(|| Error::Corrupt("preset dictionary not available".into()))?;
-            decode_codec(p.codec, packed, p.codec_out, &prefix)?
+            undo_recomp(&p, decode_codec(p.codec, packed, p.codec_out, &prefix)?, size)?
         }
     };
     match p.ldm {

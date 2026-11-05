@@ -22,6 +22,7 @@ use crate::format::{self, BlockInfo, Entry, EntryKind, Footer, Index, Step, HEAD
 use crate::history::History;
 use crate::ldm::LdmEncoder;
 use crate::preset::pick_threads;
+use crate::recomp::{self, Kind, Segment};
 use crate::{fsmeta, paths, Error, Phase, Preset, Progress, Result};
 
 /// Options for [`create`].
@@ -94,6 +95,8 @@ struct Job {
     prefix: Vec<u8>,
     /// Mostly Windows executables: use the x86 filter.
     x86: bool,
+    /// Whole files in the block that may be recompressed (JPEG…).
+    segments: Vec<Segment>,
 }
 
 /// A filled read buffer.
@@ -101,6 +104,7 @@ struct Raw {
     data: Vec<u8>,
     /// How many of its bytes come from executables (files starting with "MZ").
     exe_bytes: usize,
+    segments: Vec<Segment>,
 }
 
 /// Turns filled buffers into jobs: runs the long-range matcher and keeps
@@ -119,15 +123,18 @@ impl Blocker {
     fn send(&mut self, raw: Raw) -> Result<()> {
         let x86 = raw.exe_bytes * 2 > raw.data.len();
         let orig = Arc::new(raw.data);
-        let mut job = Job { no: self.no, orig: orig.clone(), ldm: None, prefix: Vec::new(), x86 };
+        // Recompressed blocks stand alone: no long-range matches or preset
+        // dictionary (they would change the bytes the recompressor sees).
+        let plain = raw.segments.is_empty();
+        let mut job = Job { no: self.no, orig: orig.clone(), ldm: None, prefix: Vec::new(), x86, segments: raw.segments };
         if let Some(h) = &mut self.hist {
             // Executables get the x86 filter instead: a preset dictionary
             // costs time there and gains little.
-            if self.prefix > 0 && self.bstart > 0 && !x86 {
+            if self.prefix > 0 && self.bstart > 0 && !x86 && plain {
                 let start = self.bstart.saturating_sub(self.prefix as u64);
                 job.prefix = h.copy_range(start, self.bstart).unwrap_or_default();
             }
-            if let Some(l) = &mut self.ldm {
+            if let (Some(l), true) = (&mut self.ldm, plain) {
                 let t = Instant::now();
                 job.ldm = l.encode(h, self.bstart, &orig);
                 self.ldm_time += t.elapsed();
@@ -444,6 +451,11 @@ fn fit_block_size(total: u64, base: usize, threads: usize) -> usize {
 fn encode_block(method: &Method, window_log: Option<u8>, job: Job) -> Result<Encoded> {
     let orig = &job.orig;
     let unpacked = orig.len() as u64;
+    if !job.segments.is_empty() && matches!(method, Method::Lzma2 { .. }) {
+        if let Some(enc) = encode_recompressed(method, &job)? {
+            return Ok(enc);
+        }
+    }
     let ldm = job.ldm.as_ref().zip(window_log);
     let input = job.ldm.as_deref().unwrap_or(orig);
     // Already-compressed data (photos, video, zips): full LZMA would waste
@@ -480,6 +492,28 @@ fn encode_block(method: &Method, window_log: Option<u8>, job: Job) -> Result<Enc
     };
     let hash = *blake3::hash(&packed).as_bytes();
     Ok(Encoded { no: job.no, unpacked, chain, packed, hash })
+}
+
+/// Recompresses the block's JPEGs etc. The rest of the block (if any worth
+/// mentioning) goes through the normal codec. `None` if nothing got smaller.
+fn encode_recompressed(method: &Method, job: &Job) -> Result<Option<Encoded>> {
+    let Some((payload, raw_len)) = recomp::encode(&job.orig, &job.segments) else {
+        return Ok(None);
+    };
+    let mut chain = vec![codec::recomp_step(payload.len())];
+    let mut packed = payload;
+    // Encoded images don't compress further; only bother when there's a
+    // fair amount of other data in the block.
+    if raw_len * 8 >= packed.len() {
+        let Method::Lzma2 { preset, dict_size, .. } = *method else { unreachable!() };
+        let m = Method::Lzma2 { preset, dict_size, prefix: 0 };
+        if let Some((step, out)) = codec::encode(&m, &packed, &[], job.x86)? {
+            chain.push(step);
+            packed = out;
+        }
+    }
+    let hash = *blake3::hash(&packed).as_bytes();
+    Ok(Some(Encoded { no: job.no, unpacked: job.orig.len() as u64, chain, packed, hash }))
 }
 
 /// Walks the inputs and returns everything to add.
@@ -613,16 +647,37 @@ struct Packer {
     buf: Vec<u8>,
     block_size: usize,
     exe_bytes: usize,
+    segments: Vec<Segment>,
     blocks: u64,
     tx: SyncSender<Raw>,
 }
+
+/// Largest file that is recompressed as one piece (a bigger one is stored
+/// the normal way).
+const MAX_SEGMENT: usize = 64 << 20;
 
 impl Packer {
     fn send(&mut self) -> Result<()> {
         self.blocks += 1;
         let data = std::mem::replace(&mut self.buf, Vec::with_capacity(self.block_size));
-        let raw = Raw { data, exe_bytes: std::mem::take(&mut self.exe_bytes) };
+        let raw = Raw { data, exe_bytes: std::mem::take(&mut self.exe_bytes), segments: std::mem::take(&mut self.segments) };
         self.tx.send(raw).map_err(|_| Error::Cancelled)
+    }
+
+    /// Adds a whole file. A recompressible one is kept in a single block
+    /// (a new block is started if it doesn't fit; a big one gets its own).
+    fn push_file(&mut self, data: &[u8]) -> Result<()> {
+        match Kind::sniff(data) {
+            Some(kind) if data.len() <= MAX_SEGMENT => {
+                if !self.buf.is_empty() && self.buf.len() + data.len() > self.block_size {
+                    self.send()?;
+                }
+                self.segments.push(Segment { offset: self.buf.len(), len: data.len(), kind });
+                self.buf.extend_from_slice(data);
+                Ok(())
+            }
+            _ => self.push(data, data.starts_with(b"MZ")),
+        }
     }
 
     fn push(&mut self, mut data: &[u8], exe: bool) -> Result<()> {
@@ -666,6 +721,22 @@ impl Packer {
         }
         Ok((size, *hasher.finalize().as_bytes()))
     }
+}
+
+/// For a big file: if it's a type we recompress (and not huge), reads it
+/// whole; otherwise rewinds so it can be streamed.
+fn read_if_recompressible(f: &mut File) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::{Seek, SeekFrom};
+    let mut head = [0u8; 16];
+    let n = f.read(&mut head)?;
+    let small_enough = f.metadata()?.len() <= MAX_SEGMENT as u64;
+    if small_enough && Kind::sniff(&head[..n]).is_some() {
+        let mut data = head[..n].to_vec();
+        f.read_to_end(&mut data)?;
+        return Ok(Some(data));
+    }
+    f.seek(SeekFrom::Start(0))?;
+    Ok(None)
 }
 
 /// Reader: concatenates files into blocks and hashes them. Small files are
@@ -714,7 +785,7 @@ fn read_files(
         let _guard = QuitGuard(&ahead);
         let mut recs = Vec::with_capacity(files.len());
         let mut warnings = Vec::new();
-        let mut out = Packer { buf: Vec::with_capacity(block_size), block_size, exe_bytes: 0, blocks: 0, tx: raw_tx };
+        let mut out = Packer { buf: Vec::with_capacity(block_size), block_size, exe_bytes: 0, segments: Vec::new(), blocks: 0, tx: raw_tx };
         let mut pos = 0u64;
 
         for (i, (item, path, _)) in files.iter().enumerate() {
@@ -723,7 +794,7 @@ fn read_files(
             }
             let (size, hash) = match ahead.take(i) {
                 Some(Ok((data, hash))) => {
-                    out.push(&data, data.starts_with(b"MZ"))?;
+                    out.push_file(&data)?;
                     (data.len() as u64, hash)
                 }
                 Some(Err(e)) => {
@@ -731,7 +802,13 @@ fn read_files(
                     continue;
                 }
                 None => match File::open(path) {
-                    Ok(mut f) => out.stream(&mut f, path, &stopped)?,
+                    Ok(mut f) => match read_if_recompressible(&mut f).map_err(|e| Error::file(path, e))? {
+                        Some(data) => {
+                            out.push_file(&data)?;
+                            (data.len() as u64, *blake3::hash(&data).as_bytes())
+                        }
+                        None => out.stream(&mut f, path, &stopped)?,
+                    },
                     Err(e) => {
                         warnings.push(format!("skipped {}: {e}", path.display()));
                         continue;

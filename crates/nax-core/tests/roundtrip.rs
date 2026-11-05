@@ -119,6 +119,53 @@ fn round_trip_every_preset() {
     }
 }
 
+/// A photo-like test JPEG (smooth gradients plus grain).
+fn jpeg(w: u16, h: u16, seed: u64) -> Vec<u8> {
+    let noise = random_bytes(w as usize * h as usize, seed);
+    let mut px = Vec::with_capacity(w as usize * h as usize * 3);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let n = noise[y * w as usize + x] / 8;
+            px.extend_from_slice(&[(x * 255 / w as usize) as u8 ^ n, (y * 255 / h as usize) as u8, 128u8.wrapping_add(n)]);
+        }
+    }
+    let mut out = Vec::new();
+    let enc = jpeg_encoder::Encoder::new(&mut out, 92);
+    enc.encode(&px, w, h, jpeg_encoder::ColorType::Rgb).unwrap();
+    out
+}
+
+#[test]
+fn jpegs_are_recompressed_losslessly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("photos");
+    fs::create_dir_all(&root).unwrap();
+    let mut total = 0;
+    for (i, (w, h)) in [(320, 240), (640, 480), (200, 150), (1600, 1200)].into_iter().enumerate() {
+        let j = jpeg(w, h, i as u64 + 1);
+        total += j.len();
+        fs::write(root.join(format!("p{i}.jpg")), j).unwrap();
+    }
+    // Starts like a JPEG but isn't one: must be stored the normal way.
+    let mut fake = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    fake.extend(random_bytes(50_000, 9));
+    fs::write(root.join("fake.jpg"), &fake).unwrap();
+    fs::write(root.join("notes.txt"), text(2_000)).unwrap();
+    let original = snapshot(&root);
+
+    let archive = tmp.path().join("photos.nax");
+    let s = create(&archive, &[root.clone()], &opts(Preset::Balanced), &mut noop).unwrap();
+    let a = Archive::open(&archive).unwrap();
+    assert!(a.blocks().iter().any(|b| b.method_name() == "recompress"));
+    // The big photo is > 1 MB block size and must still be recompressed.
+    assert!(s.archive_size < (total + fake.len()) as u64 * 85 / 100, "{} vs {total}", s.archive_size);
+
+    a.test(Some(2), None, &mut noop).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, &ExtractOptions::default(), &mut noop).unwrap();
+    assert_eq!(snapshot(&out.join("photos")), original);
+}
+
 #[test]
 fn long_range_matches_shrink_far_duplicates() {
     let tmp = tempfile::tempdir().unwrap();

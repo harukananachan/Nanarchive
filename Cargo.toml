@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = ["crates/nax-core", "crates/nax-cli", "app/src-tauri"]
 
@@ -17,5 +17,6 @@ clap = { version = "4", features = ["derive"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind (not abort): third-party image codecs are wrapped in catch_unwind
+# so a damaged file can't crash the program.
 strip = true

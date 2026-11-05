@@ -1,4 +1,4 @@
-//! Nanarchive core: the `.nax` archive format and compression engine.
+﻿//! Nanarchive core: the `.nax` archive format and compression engine.
 //!
 //! - [`create`] builds an archive from files and folders.
 //! - [`Archive`] opens one to list, extract or test it.
@@ -16,6 +16,7 @@ mod history;
 mod ldm;
 pub mod paths;
 mod preset;
+mod recomp;
 mod varint;
 
 pub use archive::{Archive, ExtractOptions, ExtractStats, Overwrite, TestStats};

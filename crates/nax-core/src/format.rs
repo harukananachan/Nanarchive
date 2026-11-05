@@ -14,6 +14,7 @@ pub const FILE_HASH_LEN: usize = 8;
 pub const STEP_ZSTD: u8 = 1;
 pub const STEP_LZMA2: u8 = 2;
 pub const STEP_LDM: u8 = 3;
+pub const STEP_RECOMP: u8 = 4;
 
 // Sanity limits so a malicious index can't make us allocate absurd amounts.
 const MAX_PATH_LEN: usize = 32 * 1024;
@@ -102,6 +103,9 @@ pub struct BlockInfo {
 impl BlockInfo {
     /// Short human name of the method, e.g. "zstd", "lzma2", "store".
     pub fn method_name(&self) -> &'static str {
+        if self.chain.iter().any(|s| s.id == STEP_RECOMP) {
+            return "recompress";
+        }
         match self.chain.iter().rev().map(|s| s.id).find(|&id| id != STEP_LDM) {
             None => "store",
             Some(STEP_ZSTD) => "zstd",
