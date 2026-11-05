@@ -18,9 +18,13 @@
 
 use std::io::Cursor;
 
-use lepton_jpeg::{EnabledFeatures, SingleThreadPool};
+use lepton_jpeg::{EnabledFeatures, SingleThreadPool, DEFAULT_THREAD_POOL};
+
+/// JPEGs bigger than this are encoded with several threads.
+const BIG_JPEG: usize = 2 << 20;
 
 use crate::varint::{Dec, Enc};
+use crate::zipped::{self, Container};
 use crate::{Error, Result};
 
 /// What a segment holds.
@@ -28,19 +32,44 @@ use crate::{Error, Result};
 pub(crate) enum Kind {
     /// JPEG image, re-encoded with Lepton.
     Jpeg = 1,
+    /// PNG image: deflate data unpacked (see zipped.rs).
+    Png = 2,
+    /// ZIP, DOCX, XLSX, JAR, APK…: deflate entries unpacked.
+    Zip = 3,
+    /// GZip file.
+    Gzip = 4,
 }
 
 impl Kind {
     fn from_u8(v: u8) -> Option<Kind> {
         match v {
             1 => Some(Kind::Jpeg),
+            2 => Some(Kind::Png),
+            3 => Some(Kind::Zip),
+            4 => Some(Kind::Gzip),
             _ => None,
         }
     }
 
     /// Detects a file type worth recompressing from its first bytes.
     pub fn sniff(head: &[u8]) -> Option<Kind> {
-        head.starts_with(&[0xFF, 0xD8, 0xFF]).then_some(Kind::Jpeg)
+        if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            return Some(Kind::Jpeg);
+        }
+        Some(match Container::sniff(head)? {
+            Container::Png => Kind::Png,
+            Container::Zip => Kind::Zip,
+            Container::Gzip => Kind::Gzip,
+        })
+    }
+
+    fn container(self) -> Option<Container> {
+        match self {
+            Kind::Jpeg => None,
+            Kind::Png => Some(Container::Png),
+            Kind::Zip => Some(Container::Zip),
+            Kind::Gzip => Some(Container::Gzip),
+        }
     }
 }
 
@@ -62,20 +91,41 @@ fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(None)
 }
 
-fn encode_one(kind: Kind, data: &[u8]) -> Option<Vec<u8>> {
+/// How hard to try: deflate streams expanding more than `max_expand` times
+/// are skipped (0 = no deflate recompression).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Effort {
+    pub max_expand: usize,
+    /// ...and those unpacking to more than this many bytes.
+    pub max_plain: usize,
+}
+
+fn encode_one(kind: Kind, data: &[u8], effort: Effort) -> Option<Vec<u8>> {
+    if let Some(c) = kind.container() {
+        return (effort.max_expand > 0).then(|| zipped::encode(c, data, effort.max_expand, effort.max_plain)).flatten();
+    }
     match kind {
         // encode_lepton_verify decodes the result again and compares, so a
         // file Lepton can't reproduce exactly is simply left as it is.
+        // A big photo would hold up the whole archive on one core: let
+        // Lepton split it over several threads.
         Kind::Jpeg => guarded(|| {
-            lepton_jpeg::encode_lepton_verify(data, &features(), &SingleThreadPool::default())
-                .ok()
-                .map(|(v, _)| v)
+            let r = if data.len() > BIG_JPEG {
+                lepton_jpeg::encode_lepton_verify(data, &features(), &DEFAULT_THREAD_POOL)
+            } else {
+                lepton_jpeg::encode_lepton_verify(data, &features(), &SingleThreadPool::default())
+            };
+            r.ok().map(|(v, _)| v)
         }),
+        _ => None,
     }
 }
 
 fn decode_one(kind: Kind, enc: &[u8], len: usize) -> Result<Vec<u8>> {
     let bad = || Error::Corrupt("recompressed file is damaged".into());
+    if kind.container().is_some() {
+        return zipped::decode(enc, len);
+    }
     let out = match kind {
         Kind::Jpeg => guarded(|| {
             let mut out = Vec::with_capacity(len);
@@ -83,6 +133,7 @@ fn decode_one(kind: Kind, enc: &[u8], len: usize) -> Result<Vec<u8>> {
                 .ok()
                 .map(|_| out)
         }),
+        _ => None,
     };
     match out {
         Some(v) if v.len() == len => Ok(v),
@@ -91,14 +142,33 @@ fn decode_one(kind: Kind, enc: &[u8], len: usize) -> Result<Vec<u8>> {
 }
 
 /// Recompresses the given segments of `block`. Returns the payload and how
-/// many of its bytes are raw (still worth a general compressor), or `None`
-/// if no segment got smaller.
-pub(crate) fn encode(block: &[u8], segments: &[Segment]) -> Option<(Vec<u8>, usize)> {
+/// many of its bytes are still worth a general compressor (raw bytes and
+/// unpacked deflate data), or `None` if no segment was recompressed.
+pub(crate) fn encode(block: &[u8], segments: &[Segment], effort: Effort) -> Option<(Vec<u8>, usize)> {
+    // Files are independent: work on several at once.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8).min(segments.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Vec<u8>>>> = segments.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let work = || loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(s) = segments.get(i) else { break };
+        *slots[i].lock().unwrap() = encode_one(s.kind, &block[s.offset..s.offset + s.len], effort);
+    };
+    if threads <= 1 {
+        work();
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(work);
+            }
+        });
+    }
     let mut done = Vec::new();
-    for s in segments {
-        let data = &block[s.offset..s.offset + s.len];
-        if let Some(enc) = encode_one(s.kind, data) {
-            if enc.len() < data.len() {
+    for (s, slot) in segments.iter().zip(slots) {
+        if let Some(enc) = slot.into_inner().unwrap() {
+            // Unpacked deflate data is bigger, but LZMA shrinks it far below
+            // the original; images must get smaller right away.
+            if s.kind.container().is_some() || enc.len() < s.len {
                 done.push((*s, enc));
             }
         }
@@ -119,13 +189,13 @@ pub(crate) fn encode(block: &[u8], segments: &[Segment]) -> Option<(Vec<u8>, usi
         pos = s.offset + s.len;
     }
     raw.extend_from_slice(&block[pos..]);
-    let raw_len = raw.len();
+    let compressible = raw.len() + done.iter().filter(|(s, _)| s.kind.container().is_some()).map(|(_, e)| e.len()).sum::<usize>();
     let mut out = head.buf;
     out.extend_from_slice(&raw);
     for (_, enc) in &done {
         out.extend_from_slice(enc);
     }
-    Some((out, raw_len))
+    Some((out, compressible))
 }
 
 /// Rebuilds a block of `size` bytes from its payload.
@@ -175,7 +245,7 @@ mod tests {
     fn non_jpeg_segments_are_left_alone() {
         let block = vec![0xFFu8, 0xD8, 0xFF, 0, 1, 2, 3, 4];
         let segs = [Segment { offset: 0, len: 8, kind: Kind::Jpeg }];
-        assert!(encode(&block, &segs).is_none(), "garbage JPEG must not be recompressed");
+        assert!(encode(&block, &segs, Effort { max_expand: 8, max_plain: 1 << 20 }).is_none(), "garbage JPEG must not be recompressed");
     }
 
     #[test]

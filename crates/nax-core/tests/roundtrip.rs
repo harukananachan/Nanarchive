@@ -167,6 +167,31 @@ fn jpegs_are_recompressed_losslessly() {
 }
 
 #[test]
+fn identical_files_are_stored_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("same");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    let noise = random_bytes(400_000, 5);
+    for name in ["a.bin", "sub/b.bin", "z.bin"] {
+        fs::write(root.join(name), &noise).unwrap();
+    }
+    fs::write(root.join("other.txt"), text(500)).unwrap();
+    let archive = tmp.path().join("same.nax");
+    let s = create(&archive, &[root.clone()], &opts(Preset::Balanced), &mut noop).unwrap();
+    assert!(s.archive_size < 500_000, "copies must be free: {}", s.archive_size);
+
+    let a = Archive::open(&archive).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, &ExtractOptions::default(), &mut noop).unwrap();
+    assert_eq!(snapshot(&out.join("same")), snapshot(&root));
+    // Only the last copy.
+    let out2 = tmp.path().join("out2");
+    let only = ExtractOptions { only: vec!["same/z.bin".into()], ..Default::default() };
+    a.extract(&out2, &only, &mut noop).unwrap();
+    assert_eq!(fs::read(out2.join("same/z.bin")).unwrap(), noise);
+}
+
+#[test]
 fn long_range_matches_shrink_far_duplicates() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("dup");

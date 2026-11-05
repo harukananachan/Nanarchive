@@ -4,7 +4,7 @@
 //! N worker threads compress blocks in parallel, and the calling thread
 //! writes finished blocks to disk in order.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
@@ -297,11 +297,12 @@ fn create_inner(
             let rx = job_rx.clone();
             let tx = res_tx.clone();
             let method = params.method.clone();
+            let effort = recomp::Effort { max_expand: params.max_expand, max_plain: params.max_plain };
             thread::spawn(move || loop {
                 lower_priority();
                 let job = rx.lock().unwrap().recv();
                 let Ok(job) = job else { break };
-                if tx.send(encode_block(&method, window_log, job)).is_err() {
+                if tx.send(encode_block(&method, window_log, effort, job)).is_err() {
                     break;
                 }
             })
@@ -448,11 +449,11 @@ fn fit_block_size(total: u64, base: usize, threads: usize) -> usize {
     ideal.clamp(min, base + base / 2)
 }
 
-fn encode_block(method: &Method, window_log: Option<u8>, job: Job) -> Result<Encoded> {
+fn encode_block(method: &Method, window_log: Option<u8>, effort: recomp::Effort, job: Job) -> Result<Encoded> {
     let orig = &job.orig;
     let unpacked = orig.len() as u64;
     if !job.segments.is_empty() && matches!(method, Method::Lzma2 { .. }) {
-        if let Some(enc) = encode_recompressed(method, &job)? {
+        if let Some(enc) = encode_recompressed(method, effort, &job)? {
             return Ok(enc);
         }
     }
@@ -474,7 +475,13 @@ fn encode_block(method: &Method, window_log: Option<u8>, job: Job) -> Result<Enc
         }
     }
     let prefix = if method.prefix() > 0 { &job.prefix[..] } else { &[] };
-    let encoded = codec::encode(method, input, prefix, job.x86)?;
+    // A big file kept whole (an archive that couldn't be unpacked) makes an
+    // oversized block: compress it on several threads.
+    let encoded = if prefix.is_empty() && !job.x86 && input.len() > 8 << 20 {
+        codec::encode_chunked(method, input, 4 << 20)?
+    } else {
+        codec::encode(method, input, prefix, job.x86)?
+    };
     let (chain, packed) = match (encoded, ldm) {
         (Some((step, packed)), _) if (packed.len() as u64) < unpacked => {
             let mut chain = Vec::with_capacity(2);
@@ -496,10 +503,16 @@ fn encode_block(method: &Method, window_log: Option<u8>, job: Job) -> Result<Enc
 
 /// Recompresses the block's JPEGs etc. The rest of the block (if any worth
 /// mentioning) goes through the normal codec. `None` if nothing got smaller.
-fn encode_recompressed(method: &Method, job: &Job) -> Result<Option<Encoded>> {
-    let Some((payload, raw_len)) = recomp::encode(&job.orig, &job.segments) else {
+fn encode_recompressed(method: &Method, effort: recomp::Effort, job: &Job) -> Result<Option<Encoded>> {
+    let t0 = Instant::now();
+    let timing = std::env::var_os("NAX_TIMING").is_some();
+    let Some((payload, raw_len)) = recomp::encode(&job.orig, &job.segments, effort) else {
+        if timing {
+            eprintln!("block {}: {} segs, recomp failed after {:.2}s", job.no, job.segments.len(), t0.elapsed().as_secs_f64());
+        }
         return Ok(None);
     };
+    let t_recomp = t0.elapsed().as_secs_f64();
     let mut chain = vec![codec::recomp_step(payload.len())];
     let mut packed = payload;
     // Encoded images don't compress further; only bother when there's a
@@ -507,10 +520,27 @@ fn encode_recompressed(method: &Method, job: &Job) -> Result<Option<Encoded>> {
     if raw_len * 8 >= packed.len() {
         let Method::Lzma2 { preset, dict_size, .. } = *method else { unreachable!() };
         let m = Method::Lzma2 { preset, dict_size, prefix: 0 };
-        if let Some((step, out)) = codec::encode(&m, &packed, &[], job.x86)? {
+        // Unpacked PNG/ZIP data can be many times the block size: use
+        // several threads so one block doesn't hold up the whole archive.
+        let chunk = (dict_size as usize).clamp(1 << 20, 4 << 20);
+        if let Some((step, out)) = codec::encode_chunked(&m, &packed, chunk)? {
             chain.push(step);
             packed = out;
         }
+    }
+    if timing {
+        eprintln!(
+            "block {}: {} segs {:.1} MB -> payload {:.1} MB -> {:.1} MB; recomp {t_recomp:.2}s, total {:.2}s",
+            job.no,
+            job.segments.len(),
+            job.orig.len() as f64 / 1e6,
+            raw_len as f64 / 1e6,
+            packed.len() as f64 / 1e6,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    if packed.len() >= job.orig.len() {
+        return Ok(None); // unpacked archives that don't pack better: keep as is
     }
     let hash = *blake3::hash(&packed).as_bytes();
     Ok(Some(Encoded { no: job.no, unpacked: job.orig.len() as u64, chain, packed, hash }))
@@ -667,7 +697,8 @@ impl Packer {
     /// Adds a whole file. A recompressible one is kept in a single block
     /// (a new block is started if it doesn't fit; a big one gets its own).
     fn push_file(&mut self, data: &[u8]) -> Result<()> {
-        match Kind::sniff(data) {
+        let kind = Kind::sniff(data).filter(|&k| k != Kind::Zip || crate::zipped::zip_worth_trying(data));
+        match kind {
             Some(kind) if data.len() <= MAX_SEGMENT => {
                 if !self.buf.is_empty() && self.buf.len() + data.len() > self.block_size {
                     self.send()?;
@@ -787,14 +818,29 @@ fn read_files(
         let mut warnings = Vec::new();
         let mut out = Packer { buf: Vec::with_capacity(block_size), block_size, exe_bytes: 0, segments: Vec::new(), blocks: 0, tx: raw_tx };
         let mut pos = 0u64;
+        // Identical files are stored once: later copies point at the first.
+        let mut seen: HashMap<(u64, [u8; 32]), u64> = HashMap::new();
+        let mut dedup = |data: &[u8], hash: [u8; 32], pos: u64, out: &mut Packer| -> Result<u64> {
+            let key = (data.len() as u64, hash);
+            if data.is_empty() {
+                return Ok(pos);
+            }
+            if let Some(&at) = seen.get(&key) {
+                return Ok(at);
+            }
+            seen.insert(key, pos);
+            out.push_file(data)?;
+            Ok(pos)
+        };
 
         for (i, (item, path, _)) in files.iter().enumerate() {
             if stopped() {
                 return Err(Error::Cancelled);
             }
+            let mut at = pos;
             let (size, hash) = match ahead.take(i) {
                 Some(Ok((data, hash))) => {
-                    out.push_file(&data)?;
+                    at = dedup(&data, hash, pos, &mut out)?;
                     (data.len() as u64, hash)
                 }
                 Some(Err(e)) => {
@@ -804,8 +850,9 @@ fn read_files(
                 None => match File::open(path) {
                     Ok(mut f) => match read_if_recompressible(&mut f).map_err(|e| Error::file(path, e))? {
                         Some(data) => {
-                            out.push_file(&data)?;
-                            (data.len() as u64, *blake3::hash(&data).as_bytes())
+                            let hash = *blake3::hash(&data).as_bytes();
+                            at = dedup(&data, hash, pos, &mut out)?;
+                            (data.len() as u64, hash)
                         }
                         None => out.stream(&mut f, path, &stopped)?,
                     },
@@ -815,8 +862,10 @@ fn read_files(
                     }
                 },
             };
-            recs.push(FileRec { item: *item, offset: pos, size, hash });
-            pos += size;
+            recs.push(FileRec { item: *item, offset: at, size, hash });
+            if at == pos {
+                pos += size; // new data (not a duplicate)
+            }
             files_read.fetch_add(1, Relaxed);
         }
         if !out.buf.is_empty() {

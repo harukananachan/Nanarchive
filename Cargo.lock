@@ -2416,10 +2416,12 @@ name = "nax-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crc32fast",
  "filetime",
  "jpeg-encoder",
  "lepton_jpeg",
  "liblzma-sys",
+ "miniz_oxide 0.8.9",
  "ppmd-rust",
  "preflate-rs",
  "sysinfo",

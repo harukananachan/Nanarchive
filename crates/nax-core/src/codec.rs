@@ -189,6 +189,54 @@ pub(crate) fn encode(method: &Method, data: &[u8], prefix: &[u8], x86: bool) -> 
     Ok(Some((step, out)))
 }
 
+/// LZMA2 on several threads: `data` is cut into `chunk`-sized pieces that
+/// are compressed independently and joined into one LZMA2 stream (each
+/// piece starts with a dictionary reset, which LZMA2 allows), so the
+/// decoder sees a normal stream. For big inputs such as unpacked PNG/ZIP
+/// data. Falls back to `encode` for small inputs.
+pub(crate) fn encode_chunked(method: &Method, data: &[u8], chunk: usize) -> Result<Option<(Step, Vec<u8>)>> {
+    let Method::Lzma2 { preset, dict_size, .. } = *method else {
+        return encode(method, data, &[], false);
+    };
+    let chunk = chunk.max(1 << 20);
+    if data.len() <= chunk + chunk / 2 {
+        return encode(method, data, &[], false);
+    }
+    let dict = dict_size.min(chunk.next_multiple_of(64 << 10) as u32);
+    let pieces: Vec<&[u8]> = data.chunks(chunk).collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(pieces.len()).min(8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let outs: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = pieces.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(p) = pieces.get(i) else { break };
+                let r = lzma::options(preset, dict, &[]).and_then(|mut o| lzma::run(true, false, &mut o, p, p.len() / 3 + 4096, None));
+                *outs[i].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    let mut out = Vec::new();
+    let last = outs.len() - 1;
+    for (i, m) in outs.into_iter().enumerate() {
+        let mut v = m.into_inner().unwrap().expect("every piece is encoded")?;
+        // Each piece ends with the LZMA2 end marker (a zero byte); only the
+        // last one may keep it.
+        if v.last() != Some(&0) {
+            return Err(Error::Codec("unexpected LZMA2 stream end".into()));
+        }
+        if i != last {
+            v.pop();
+        }
+        out.extend_from_slice(&v);
+    }
+    if out.len() >= data.len() {
+        return Ok(None);
+    }
+    Ok(Some((Step { id: STEP_LZMA2, props: dict.to_le_bytes().to_vec() }, out)))
+}
+
 /// Quick estimate of how compressible data is: compresses a few samples
 /// with fast zstd. Returns packed/raw in percent (100 = no gain).
 pub(crate) fn sample_ratio(data: &[u8]) -> usize {
@@ -449,6 +497,16 @@ mod tests {
         assert!(matches!(part, Partial::Packed(_)));
         let back = decode_finish(&chain, part, &hist, first.len() as u64, second.len()).unwrap();
         assert_eq!(back, second);
+    }
+
+    #[test]
+    fn chunked_lzma_is_one_valid_stream() {
+        let mut data = sample();
+        data.extend(noise(300_000));
+        data.extend(sample());
+        let m = Method::Lzma2 { preset: 6, dict_size: 8 << 20, prefix: 0 };
+        let (step, packed) = encode_chunked(&m, &data, 1 << 20).unwrap().unwrap();
+        assert_eq!(decode(&[step], packed, data.len()).unwrap(), data);
     }
 
     #[test]

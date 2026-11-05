@@ -18,6 +18,7 @@ pub mod paths;
 mod preset;
 mod recomp;
 mod varint;
+mod zipped;
 
 pub use archive::{Archive, ExtractOptions, ExtractStats, Overwrite, TestStats};
 pub use create::{create, CreateOptions, CreateStats};

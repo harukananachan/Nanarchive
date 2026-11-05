@@ -30,6 +30,12 @@ pub(crate) struct Params {
     pub mem_per_thread: u64,
     /// Long-range matcher window (log2 bytes), if enabled.
     pub ldm_window_log: Option<u8>,
+    /// Deflate streams (PNG, ZIP…) expanding more than this are left alone
+    /// (0 = off). Unpacking costs time in proportion to the unpacked size.
+    pub max_expand: usize,
+    /// ...or unpacking to more than this many bytes (one stream is
+    /// analyzed on one core at ~1-2 MB/s).
+    pub max_plain: usize,
 }
 
 impl Preset {
@@ -63,24 +69,32 @@ impl Preset {
                 block_size: 16 * MIB,
                 mem_per_thread: mb(40),
                 ldm_window_log: None,
+                max_expand: 0,
+                max_plain: 0,
             },
             Preset::Fast => Params {
                 method: Method::Zstd { level: 3, window_log: 23, long: false },
                 block_size: 16 * MIB,
                 mem_per_thread: mb(80),
                 ldm_window_log: None,
+                max_expand: 0,
+                max_plain: 0,
             },
             Preset::Balanced => Params {
                 method: Method::Lzma2 { preset: 9, dict_size: 8 << 20, prefix: MIB },
                 block_size: 4 * MIB,
                 mem_per_thread: mb(110),
                 ldm_window_log: Some(28),
+                max_expand: 6,
+                max_plain: 3 * MIB,
             },
             Preset::Max => Params {
                 method: Method::Lzma2 { preset: 9, dict_size: 24 << 20, prefix: 8 * MIB },
                 block_size: 8 * MIB,
                 mem_per_thread: mb(330),
                 ldm_window_log: Some(28),
+                max_expand: 32,
+                max_plain: 32 * MIB,
             },
             Preset::Ultra => Params {
                 method: Method::Lzma2 {
@@ -91,6 +105,8 @@ impl Preset {
                 block_size: 16 * MIB,
                 mem_per_thread: mb(800),
                 ldm_window_log: Some(30),
+                max_expand: 1000,
+                max_plain: 128 * MIB,
             },
         }
     }
