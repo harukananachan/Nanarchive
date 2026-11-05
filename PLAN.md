@@ -112,7 +112,8 @@ light & dark themes, accent color picker.
 **Phase 0 — Setup** ✅ done
 Install toolchain, create Git repo, Rust workspace: `nax-core`, `nax-cli`, `nax-app` (Tauri), app icon.
 
-**Phase 1 — Core format + CLI**
+**Phase 1 — Core format + CLI** ✅ done
+(First result: Max is 6% smaller than WinRAR Best on a 95 MB code folder, but ~15× slower — speed work later.)
 `.nax` writer/reader, zstd + LZMA2, solid blocks, BLAKE3, multi-thread.
 CLI: `nar a`, `nar x`, `nar l`, `nar t` (add / extract / list / test).
 ✅ Done when: round-trip any folder bit-exact, list a big archive instantly.

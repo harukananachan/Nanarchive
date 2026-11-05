@@ -1,14 +1,30 @@
 //! Nanarchive core: the `.nax` archive format and compression engine.
 //!
-//! Phase 0 only defines the basic building blocks. The real reader/writer
-//! arrives in Phase 1 (see PLAN.md).
+//! - [`create`] builds an archive from files and folders.
+//! - [`Archive`] opens one to list, extract or test it.
+//!
+//! The format is described in `docs/FORMAT.md`.
 
-use std::fmt;
+use std::path::PathBuf;
+
+mod archive;
+mod codec;
+mod create;
+pub mod format;
+pub mod fsmeta;
+pub mod paths;
+mod preset;
+mod varint;
+
+pub use archive::{Archive, ExtractOptions, ExtractStats, Overwrite, TestStats};
+pub use create::{create, CreateOptions, CreateStats};
+pub use format::{BlockInfo, Entry, EntryKind};
+pub use preset::Preset;
 
 /// File extension for Nanarchive archives.
 pub const EXTENSION: &str = "nax";
 
-/// Magic bytes at the start (and end) of every `.nax` file.
+/// Magic bytes at the start and end of every `.nax` file.
 pub const MAGIC: [u8; 4] = *b"NANA";
 
 /// Current on-disk format version.
@@ -17,57 +33,27 @@ pub const FORMAT_VERSION: u16 = 1;
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Compression presets shown to the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Preset {
-    /// No compression.
-    Store,
-    /// zstd, fast.
-    Fast,
-    /// zstd high + specialists. Default.
-    #[default]
-    Balanced,
-    /// LZMA2 + filters + dedup + specialists.
-    Max,
-    /// Max + context mixing. Smallest, slowest.
-    Ultra,
+/// Which stage a long operation is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Scanning,
+    Compressing,
+    Finishing,
+    Extracting,
+    Testing,
 }
 
-impl Preset {
-    pub const ALL: [Preset; 5] = [
-        Preset::Store,
-        Preset::Fast,
-        Preset::Balanced,
-        Preset::Max,
-        Preset::Ultra,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Preset::Store => "store",
-            Preset::Fast => "fast",
-            Preset::Balanced => "balanced",
-            Preset::Max => "max",
-            Preset::Ultra => "ultra",
-        }
-    }
-}
-
-impl fmt::Display for Preset {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for Preset {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        Preset::ALL
-            .into_iter()
-            .find(|p| p.name().eq_ignore_ascii_case(s))
-            .ok_or_else(|| Error::UnknownPreset(s.to_string()))
-    }
+/// Progress report passed to callbacks.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    pub phase: Phase,
+    /// Uncompressed bytes processed so far.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// Compressed bytes written (create) or read (extract/test).
+    pub packed_bytes: u64,
+    pub files_done: u64,
+    pub files_total: u64,
 }
 
 /// Errors from the core library.
@@ -75,14 +61,35 @@ impl std::str::FromStr for Preset {
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{}: {source}", path.display())]
+    File {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("not a .nax archive")]
     BadMagic,
-    #[error("unsupported format version {0}")]
+    #[error("unsupported format version {0} (made by a newer Nanarchive?)")]
     UnsupportedVersion(u16),
     #[error("unknown preset '{0}' (use store, fast, balanced, max or ultra)")]
     UnknownPreset(String),
-    #[error("not implemented yet: {0}")]
-    NotImplemented(&'static str),
+    #[error("archive is damaged: {0}")]
+    Corrupt(String),
+    #[error("compression error: {0}")]
+    Codec(String),
+    #[error("unsafe path in archive, refusing to extract: {0:?}")]
+    UnsafePath(String),
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("{} already exists", .0.display())]
+    AlreadyExists(PathBuf),
+    #[error("cancelled")]
+    Cancelled,
+}
+
+impl Error {
+    pub(crate) fn file(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
+        Error::File { path: path.into(), source }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
