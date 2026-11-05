@@ -57,19 +57,38 @@ sizes before it, and the total must end exactly at `index_offset`.
 ### Codec chain
 
 Each block has a chain of steps applied in order when compressing (reversed when extracting).
-Allowed shapes: `[]` (stored raw), `[codec]`, `[LDM]`, `[LDM, codec]`.
+Allowed shapes: `[]` (stored raw), `[codec]`, `[LDM]`, `[LDM, codec]`, `[RECOMP]`, `[RECOMP, codec]`.
 
 | Step id | Name | Props |
 |---|---|---|
 | 1 | zstd | 1 byte: window log (10–31) |
 | 2 | LZMA2 (raw) | 4 bytes: dictionary size (u32); optionally + 4 bytes: preset-dictionary length (u32); optionally + 1 byte flags (bit 0: x86 BCJ filter in front of LZMA2) |
 | 3 | LDM (long-range matches) | u8 window log, varint payload length |
+| 4 | RECOMP (recompressed files) | varint payload length |
 
 **Preset dictionary.** If the LZMA2 props carry a length `P > 0`, the coder is primed with the `P`
 original stream bytes just before the block. Such blocks are decoded in stream order.
 
 **x86 filter.** liblzma's BCJ x86 filter (start offset 0) runs before LZMA2. It is used for blocks
 that are mostly Windows executables (files starting with `MZ`).
+
+**RECOMP payload.** Whole files inside the block (JPEG, PNG, ZIP-family, GZip) are replaced by a
+re-encoded form that rebuilds the exact original bytes:
+
+```
+varint  segment_count
+repeat: varint gap (raw bytes before the segment), varint original length, u8 kind, varint encoded length
+bytes   all raw bytes, in order
+bytes   all encoded segments, in order
+```
+
+Kinds: 1 = JPEG (Lepton), 2 = PNG, 3 = ZIP, 4 = GZip. Kinds 2–4 use the "unpacked deflate"
+layout from `crates/nax-core/src/zipped.rs`: a piece list (raw / deflate / PNG IDAT group), then
+raw bytes, decompressed data and preflate corrections. IDAT CRCs are recomputed when rebuilding.
+A big LZMA2 payload may be several independently compressed pieces joined into one stream (each
+starts with a dictionary reset), which is plain LZMA2 to the decoder.
+
+**Duplicates.** Identical files are stored once; their entries share the same stream range.
 
 **LDM payload** (the input of the codec step, or the block itself for `[LDM]`):
 
