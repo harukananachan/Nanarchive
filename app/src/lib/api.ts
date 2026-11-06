@@ -23,7 +23,7 @@ export type ArchiveView = {
   dirs: number;
   blocks: number;
   methods: string[];
-  format: "nax" | "zip";
+  format: "nax" | "zip" | "7z" | "rar";
   encrypted: boolean;
   recovery_percent: number;
   recovery_bytes: number;
@@ -84,6 +84,7 @@ export type ShellLabels = {
   add_quick: string;
 };
 export type ShellStatus = { registered: boolean; current: boolean };
+export type UpdateInfo = { version: string; notes: string };
 
 export type DirEntry = { name: string; is_dir: boolean; size: number; mtime: number; drive: boolean };
 export type DirView = { path: string; parent: string | null; entries: DirEntry[] };
@@ -123,6 +124,8 @@ export const api = {
   shellRegister: (labels: ShellLabels) => call<void>("shell_register", { labels }),
   shellUnregister: () => call<void>("shell_unregister"),
   setWindowMode: (quick: boolean, add: boolean) => call<void>("set_window_mode", { quick, add }),
+  checkUpdate: (url: string) => call<UpdateInfo | null>("check_update", { url }),
+  installUpdate: (url: string) => call<void>("install_update", { url }),
 };
 
 // --- Events ----------------------------------------------------------------
@@ -180,7 +183,7 @@ export async function pickArchive(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const r = await open({
     title: "Open archive",
-    filters: [{ name: "Archives", extensions: ["nax", "zip", "jar"] }],
+    filters: [{ name: "Archives", extensions: ["nax", "zip", "jar", "7z", "rar"] }],
   });
   return typeof r === "string" ? r : null;
 }
@@ -266,7 +269,7 @@ function mockArchive(path: string): ArchiveView {
     recovery_percent: /secret/i.test(path) ? 5 : 0,
     recovery_bytes: 2_100_000,
     parts: 1,
-    format: /\.zip$/i.test(path) ? "zip" : "nax",
+    format: /\.zip$/i.test(path) ? "zip" : /\.7z$/i.test(path) ? "7z" : /\.rar$/i.test(path) ? "rar" : "nax",
     paths,
     sizes,
     is_dir,
@@ -327,6 +330,10 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
       return new URLSearchParams(location.search).getAll("arg");
     case "take_forwarded_args":
       return [];
+    case "check_update":
+      return /^https:/.test(a.url) ? { version: "0.2.0", notes: "Demo update" } : Promise.reject("bad_url");
+    case "install_update":
+      return;
     case "shell_status":
       return { registered: true, current: true };
     case "shell_register":
@@ -334,7 +341,7 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
     case "set_window_mode":
       return;
     case "is_archive":
-      return /\.(nax|zip|jar)$/i.test(String(a.path));
+      return /\.(nax|zip|jar|7z|rar)$/i.test(String(a.path));
     case "home_dir":
       return "C:\\Users\\demo";
     case "list_dir": {
@@ -356,7 +363,7 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
       return `${dir}\\${name}.nax`;
     }
     case "suggest_extract_dir":
-      return String(a.archive).replace(/\.(nax|zip|jar)$/i, "");
+      return String(a.archive).replace(/\.(nax|zip|jar|7z|rar)$/i, "");
     case "estimate": {
       const bytes = 152_000_000 * a.inputs.length;
       return { files: 1244 * a.inputs.length, dirs: 31, bytes, sizes: [1.0, 0.31, 0.215, 0.205, 0.196].map((f) => Math.round(bytes * f)), seconds: [0.5, 1, 5, 12, 38] };

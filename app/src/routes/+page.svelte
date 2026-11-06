@@ -82,7 +82,7 @@
   const join = (dir: string, name: string) => (dir.endsWith("\\") || dir.endsWith("/") ? dir + name : `${dir}\\${name}`);
   const isNaxName = (p: string) => ext(p) === "nax";
   /** Archives Nanarchive opens itself (.docx and friends are ZIPs too, but open in their own apps). */
-  const isArcName = (p: string) => ["nax", "zip", "jar"].includes(ext(p));
+  const isArcName = (p: string) => ["nax", "zip", "jar", "7z", "rar"].includes(ext(p));
 
   function typeOf(name: string): { icon: string; type: string } {
     if (isNaxName(name)) return { icon: "nax", type: t("type.nax") };
@@ -197,7 +197,7 @@
   async function goAddress() {
     const a = addr.trim().replace(/^"|"$/g, "");
     if (!a || a === t("thisPc")) return gotoDisk("");
-    const m = a.match(/^(.*?\.(?:nax|zip|jar))(?:[\\/](.*))?$/i);
+    const m = a.match(/^(.*?\.(?:nax|zip|jar|7z|rar))(?:[\\/](.*))?$/i);
     if (m && (await api.isArchive(m[1]))) return openArchive(m[1], (m[2] ?? "").replaceAll("\\", "/").replace(/\/$/, ""));
     gotoDisk(a);
   }
@@ -488,7 +488,7 @@
   async function leaveQuick() {
     quick = false;
     await api.setWindowMode(false, false);
-    if (!loc) await gotoDisk(settings.lastDir || (await api.homeDir()));
+    if (!loc) await gotoDisk("");
   }
 
   // --- Menus ------------------------------------------------------------------
@@ -612,13 +612,21 @@
         if (quick) receiveArgs(args);
         else if (args.length === 1 && (await api.isArchive(args[0]))) await openArchive(args[0]);
         else {
-          await gotoDisk(settings.lastDir || (await api.homeDir()));
+          // Start on the list of drives, like "This PC".
+          await gotoDisk("");
           if (loc === null) await gotoDisk(await api.homeDir());
           receiveArgs(args);
         }
         for (const a of await api.takeForwardedArgs()) receiveArgs(a);
       } catch (e) {
         toast(String(e), "error");
+      }
+      // Quiet update check (only when the user set an update address).
+      if (!quick && settings.autoUpdate && settings.updateUrl.trim()) {
+        api
+          .checkUpdate(settings.updateUrl)
+          .then((u) => u && toast(t("upd.ready", { v: u.version }), "info", 9000))
+          .catch(() => {});
       }
     })();
     return () => offs.forEach((f) => f());

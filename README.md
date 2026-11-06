@@ -22,6 +22,7 @@ Rust (stable, MSVC), Visual Studio C++ Build Tools, Node.js LTS, WebView2 (built
 cargo test --workspace                  # run all tests
 cargo build --release -p nax-cli        # build target/release/nax.exe
 cd app && npm install && npm run tauri dev   # run the desktop app
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1   # installer + latest.json
 ```
 
 ## Using the `nax` command-line tool
@@ -50,4 +51,4 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 - Phase 4 (desktop app: WinRAR-style file manager, English + Russian, Explorer right-click menu and .nax icon, opens ZIP) — done
 - Phase 5 (AES-256 password encryption, recovery records + repair, split volumes, fuzzed and hardened reader) — done
 - Phase 6 (Ultra = own context-mixing codec: smaller than 7-Zip Ultra and WinRAR Best in every benchmark category; extracting Ultra is slow) — done
-- Next: Phase 7 — 7z/RAR opening, installer, auto-update
+- Phase 7 (opens 7z and RAR, Windows installer, signed auto-update from an address you choose) — done

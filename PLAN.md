@@ -180,12 +180,18 @@ available; 8 MB blocks coded in parallel. Lab: `cargo run --release -p nax-core 
 
 Trade-off: extracting Ultra is as slow as creating it (~0.3 MB/s per thread; about 35–50 s per
 100–150 MB on 28 threads). Max stays the fast choice.
-**Phase 7 — Windows integration & release**
-Opening 7z / RAR (extract only) — ZIP and the Explorer menu are already done in Phase 4,
-installer (MSI/NSIS via Tauri), auto-update.
-
----
-
+**Phase 7 — Windows integration & release** ✅ done
+- Opens 7z and RAR archives (extract only): list, extract, test, preview, passwords (7z AES,
+  also encrypted file names; RAR 4/5), split RAR sets. 7z goes through `sevenz-rust2`, RAR
+  through the official UnRAR library (`unrar` crate). Names that try to leave the target folder
+  ("../", drive letters) are refused. Explorer's menu now also covers .7z and .rar.
+- Installer: NSIS via Tauri, per-user (no admin rights), English + Russian. Uninstalling removes
+  the Explorer menu. Build with `scripts\build-installer.ps1`.
+- Auto-update: Tauri updater with our own signing key (kept outside the project in
+  `%USERPROFILE%\.nanarchive\updater.key`). The update address is set in Settings > Updates
+  (https only, empty = off), so no GitHub or other fixed host is needed. The build script writes
+  `latest.json` to upload next to the installer.
+- The app starts on the drive list ("This PC").
 ## 7. How we'll know it's "the best"
 
 - Benchmark table in the README: size and speed vs ZIP, 7z (Ultra), RAR5 (Best) on the same corpus.

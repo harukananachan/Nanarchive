@@ -35,7 +35,7 @@ mod imp {
 
     const PROGID: &str = "Nanarchive.nax";
     /// Other archive types that get "Open / Extract with Nanarchive" entries.
-    const OTHER: &[&str] = &[".zip", ".jar"];
+    const OTHER: &[&str] = &[".zip", ".jar", ".7z", ".rar"];
     /// Name of our cascade menu and prefix of our verbs.
     const KEY: &str = "Nanarchive";
 
@@ -129,7 +129,12 @@ mod imp {
         };
         match read() {
             Ok(cmd) => {
-                let current = exe().map_or(false, |e| cmd.to_lowercase().contains(&e.to_lowercase()));
+                let classes = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Classes");
+                // Older versions did not add the menu to every type in OTHER.
+                let all_types = classes.map_or(false, |c| {
+                    OTHER.iter().all(|ext| c.open_subkey(format!("SystemFileAssociations\\{ext}\\shell\\{KEY}.open")).is_ok())
+                });
+                let current = all_types && exe().map_or(false, |e| cmd.to_lowercase().contains(&e.to_lowercase()));
                 Status { registered: true, current }
             }
             Err(_) => Status { registered: false, current: false },

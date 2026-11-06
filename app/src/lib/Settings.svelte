@@ -5,6 +5,54 @@
   import { t, type Key } from "./i18n.svelte";
   import { syncExplorer } from "./explorer";
   import { toast } from "./state.svelte";
+  import { api, listen, type UpdateInfo } from "./api";
+  import { onDestroy } from "svelte";
+
+  // --- Updates ---
+  let checking = $state(false);
+  let found = $state<UpdateInfo | null>(null);
+  let upState = $state("");
+  let installing = $state(false);
+  let got = $state(0);
+  let total = $state(0);
+  let unlisten: (() => void) | null = null;
+  onDestroy(() => unlisten?.());
+
+  function upError(e: unknown) {
+    const s = String(e);
+    return s === "bad_url" ? t("upd.badUrl") : t("upd.failed", { e: s });
+  }
+
+  async function checkNow() {
+    if (!settings.updateUrl.trim()) return;
+    checking = true;
+    found = null;
+    upState = "";
+    try {
+      found = await api.checkUpdate(settings.updateUrl);
+      upState = found ? t("upd.found", { v: found.version }) : t("upd.latest");
+    } catch (e) {
+      upState = upError(e);
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function install() {
+    installing = true;
+    got = 0;
+    total = 0;
+    unlisten ??= await listen<{ done: number; total: number }>("update-progress", (p) => {
+      got = p.done;
+      total = p.total;
+    });
+    try {
+      await api.installUpdate(settings.updateUrl);
+    } catch (e) {
+      installing = false;
+      upState = upError(e);
+    }
+  }
 
   async function toggleExplorer() {
     const on = !settings.explorer;
@@ -91,6 +139,24 @@
     <select class="field" bind:value={settings.preset}>
       {#each PRESETS as p}<option value={p}>{t(`p.${p}` as Key)}</option>{/each}
     </select>
+  </div>
+
+  <div class="item col">
+    <div><b>{t("upd.title")}</b><p class="muted">{t("upd.desc")}</p></div>
+    <div class="row">
+      <input class="field grow" placeholder="https://example.com/nanarchive/latest.json" bind:value={settings.updateUrl} spellcheck="false" />
+      <button class="btn" disabled={checking || installing || !settings.updateUrl.trim()} onclick={checkNow}>{checking ? t("upd.checking") : t("upd.check")}</button>
+    </div>
+    <label class="check"><input type="checkbox" bind:checked={settings.autoUpdate} /> {t("upd.auto")}</label>
+    {#if installing}
+      <p class="muted">{t("upd.downloading")} {total ? Math.round((got / total) * 100) + "%" : ""}</p>
+    {:else if upState}
+      <p class="muted">{upState}</p>
+    {/if}
+    {#if found && !installing}
+      {#if found.notes}<p class="notes">{found.notes}</p>{/if}
+      <div><button class="btn primary" onclick={install}>{t("upd.install", { v: found.version })}</button></div>
+    {/if}
   </div>
 
   <div class="about">
@@ -184,6 +250,32 @@
   }
   .switch.on span {
     transform: translateX(20px);
+  }
+  .item.col {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+  }
+  .grow {
+    flex: 1;
+    min-width: 0;
+  }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .notes {
+    margin: 0;
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    max-height: 90px;
+    overflow: auto;
   }
   select.field {
     min-width: 150px;

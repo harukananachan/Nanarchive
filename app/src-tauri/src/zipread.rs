@@ -26,7 +26,7 @@ fn open(path: &Path) -> Result<ZipArchive<BufReader<File>>, String> {
 }
 
 /// Days since 1970-01-01 for a civil date (proleptic Gregorian).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -44,7 +44,7 @@ fn mtime(dt: Option<zip::DateTime>) -> i64 {
 }
 
 /// Entry name with `/` separators and no leading or trailing slash.
-fn clean(name: &str) -> String {
+pub(crate) fn clean(name: &str) -> String {
     name.replace('\\', "/").trim_matches('/').to_string()
 }
 
@@ -64,7 +64,7 @@ pub fn list(path: &Path) -> Result<Listing, String> {
 }
 
 /// True if `name` is one of `only` or inside one of them (all when empty).
-fn wanted(name: &str, only: &[String]) -> bool {
+pub(crate) fn wanted(name: &str, only: &[String]) -> bool {
     if only.is_empty() {
         return true;
     }
@@ -75,6 +75,7 @@ fn wanted(name: &str, only: &[String]) -> bool {
     })
 }
 
+#[derive(Debug)]
 pub struct Stats {
     pub files: u64,
     pub bytes: u64,

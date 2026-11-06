@@ -15,8 +15,11 @@ use nax_core::{Archive, CreateOptions, ExtractOptions, Overwrite, Phase, Preset,
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod foreign;
 mod shell;
 mod zipread;
+
+use foreign::Fmt;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -68,6 +71,18 @@ fn get_nax(app: &AppHandle, path: &Path, password: Option<&str>) -> nax_core::Re
     let a = Arc::new(Archive::open_with(path, password.filter(|p| !p.is_empty()))?);
     opened.0.lock().unwrap().insert(key, (st, a.clone()));
     Ok(a)
+}
+
+/// Passwords of opened 7z and RAR archives (memory only, never saved).
+#[derive(Default)]
+struct ForeignPasswords(Mutex<HashMap<String, String>>);
+
+fn pw_key(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase()
+}
+
+fn foreign_password(app: &AppHandle, p: &Path) -> Option<String> {
+    app.state::<ForeignPasswords>().0.lock().unwrap().get(&pw_key(p)).cloned()
 }
 
 /// Core errors as text for the UI; password problems get fixed codes.
@@ -127,7 +142,7 @@ fn startup_args() -> Vec<String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Nax,
-    Zip,
+    Foreign(Fmt),
 }
 
 fn archive_kind(path: &Path) -> Option<Kind> {
@@ -137,18 +152,24 @@ fn archive_kind(path: &Path) -> Option<Kind> {
             return Some(Kind::Nax);
         }
     }
-    let mut buf = [0u8; 4];
-    fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)).ok()?;
-    if nax_core::is_nax(&buf) {
+    let mut buf = [0u8; 8];
+    let mut f = fs::File::open(path).ok()?;
+    let mut n = 0;
+    while n < buf.len() {
+        match std::io::Read::read(&mut f, &mut buf[n..]) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    let head = &buf[..n];
+    if head.len() >= 4 && nax_core::is_nax(head) {
         Some(Kind::Nax)
-    } else if zipread::is_zip(&buf) {
-        Some(Kind::Zip)
     } else {
-        None
+        foreign::detect(head).map(Kind::Foreign)
     }
 }
 
-/// True for archives Nanarchive can open (.nax and ZIP).
+/// True for archives Nanarchive can open (.nax, ZIP, 7z, RAR).
 #[tauri::command]
 fn is_archive(path: String) -> bool {
     archive_kind(Path::new(&path)).is_some()
@@ -326,8 +347,13 @@ async fn open_archive(app: AppHandle, path: String, password: Option<String>) ->
     let p = PathBuf::from(&path);
     let app2 = app.clone();
     let view = tauri::async_runtime::spawn_blocking(move || -> CmdResult<ArchiveView> {
-        if archive_kind(&p) == Some(Kind::Zip) {
-            let z = zipread::list(&p)?;
+        if let Some(Kind::Foreign(fmt)) = archive_kind(&p) {
+            let given = password.filter(|s| !s.is_empty());
+            let pw = given.clone().or_else(|| foreign_password(&app2, &p));
+            let (z, encrypted) = foreign::list(fmt, &p, pw.as_deref())?;
+            if let (true, Some(pw)) = (encrypted, pw) {
+                app2.state::<ForeignPasswords>().0.lock().unwrap().insert(pw_key(&p), pw);
+            }
             let n = z.entries.len();
             let mut v = ArchiveView {
                 path: p.to_string_lossy().into_owned(),
@@ -337,9 +363,9 @@ async fn open_archive(app: AppHandle, path: String, password: Option<String>) ->
                 files: z.entries.iter().filter(|e| !e.is_dir).count() as u64,
                 dirs: z.entries.iter().filter(|e| e.is_dir).count() as u64,
                 blocks: 0,
-                methods: vec!["zip"],
-                format: "zip",
-                encrypted: false,
+                methods: vec![fmt.name()],
+                format: fmt.name(),
+                encrypted,
                 recovery_percent: 0.0,
                 recovery_bytes: 0,
                 parts: 1,
@@ -639,8 +665,10 @@ fn extract_archive(
     let handle = app.clone();
     start_job(app, &jobs, job, move |progress, cancel| {
         let path = PathBuf::from(&archive);
-        if archive_kind(&path) == Some(Kind::Zip) {
-            let s = zipread::run(&path, Some((Path::new(&dest), overwrite)), &only, &cancel, progress).map_err(zip_err)?;
+        if let Some(Kind::Foreign(fmt)) = archive_kind(&path) {
+            let pw = foreign_password(&handle, &path);
+            let s = foreign::run(fmt, &path, pw.as_deref(), Some((Path::new(&dest), overwrite)), &only, &cancel, progress)
+                .map_err(zip_err)?;
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             return Ok(DoneEvent { output: dest, files: s.files, bytes_in: size, bytes_out: s.bytes, skipped: s.skipped, ..Default::default() });
         }
@@ -669,8 +697,9 @@ fn test_archive(app: AppHandle, jobs: State<Jobs>, job: u64, archive: String) ->
     let handle = app.clone();
     start_job(app, &jobs, job, move |progress, cancel| {
         let path = PathBuf::from(&archive);
-        if archive_kind(&path) == Some(Kind::Zip) {
-            let s = zipread::run(&path, None, &[], &cancel, progress).map_err(zip_err)?;
+        if let Some(Kind::Foreign(fmt)) = archive_kind(&path) {
+            let pw = foreign_password(&handle, &path);
+            let s = foreign::run(fmt, &path, pw.as_deref(), None, &[], &cancel, progress).map_err(zip_err)?;
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             return Ok(DoneEvent { output: archive, files: s.files, bytes_in: size, bytes_out: s.bytes, ..Default::default() });
         }
@@ -758,13 +787,12 @@ async fn preview(app: AppHandle, archive: String, entry: String) -> CmdResult<Pr
         let none = |size| PreviewView { kind: "none", mime: String::new(), data: String::new(), truncated: false, size };
         let path = PathBuf::from(&archive);
 
-        let (bytes, size) = if archive_kind(&path) == Some(Kind::Zip) {
-            let bytes = zipread::read(&path, &entry, PREVIEW_MAX + 1)?;
-            if bytes.len() as u64 > PREVIEW_MAX {
-                return Ok(none(bytes.len() as u64));
+        let (bytes, size) = if let Some(Kind::Foreign(fmt)) = archive_kind(&path) {
+            let pw = foreign_password(&app, &path);
+            match foreign::read(fmt, &path, pw.as_deref(), &entry, PREVIEW_MAX)? {
+                (Some(bytes), size) => (bytes, size),
+                (None, size) => return Ok(none(size)),
             }
-            let n = bytes.len() as u64;
-            (bytes, n)
         } else {
             let a = get_nax(&app, &path, None).map_err(core_err)?;
             let e = a.entries().iter().find(|e| e.path == entry).ok_or("file not found in archive")?;
@@ -859,8 +887,61 @@ fn set_window_mode(app: AppHandle, quick: bool, add: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Updates: signed with our key; the address is set by the user (off when empty).
+
+#[derive(Serialize)]
+struct UpdateView {
+    version: String,
+    notes: String,
+}
+
+fn updater(app: &AppHandle, url: &str) -> CmdResult<tauri_plugin_updater::Updater> {
+    use tauri_plugin_updater::UpdaterExt;
+    let url: tauri::Url = url.trim().parse().map_err(|_| "bad_url".to_string())?;
+    if url.scheme() != "https" {
+        return Err("bad_url".into());
+    }
+    app.updater_builder().endpoints(vec![url]).map_err(err)?.build().map_err(err)
+}
+
+/// Asks the update address for a newer version (`None` = up to date).
+#[tauri::command]
+async fn check_update(app: AppHandle, url: String) -> CmdResult<Option<UpdateView>> {
+    let u = updater(&app, &url)?.check().await.map_err(err)?;
+    Ok(u.map(|u| UpdateView { version: u.version.clone(), notes: u.body.clone().unwrap_or_default() }))
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    done: u64,
+    total: u64,
+}
+
+/// Downloads, checks the signature and starts the installer (the app closes).
+#[tauri::command]
+async fn install_update(app: AppHandle, url: String) -> CmdResult<()> {
+    let u = updater(&app, &url)?.check().await.map_err(err)?.ok_or("no_update")?;
+    let mut done = 0u64;
+    let a = app.clone();
+    u.download_and_install(
+        move |n, total| {
+            done += n as u64;
+            let _ = a.emit("update-progress", UpdateProgress { done, total: total.unwrap_or(0) });
+        },
+        || {},
+    )
+    .await
+    .map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The uninstaller calls this to take our entries out of Explorer.
+    if std::env::args().any(|a| a == "--unregister-shell") {
+        let _ = shell::unregister();
+        return;
+    }
     tauri::Builder::default()
         // Explorer starts one process per selected file; they all hand their
         // arguments to the first one, which merges them into one job.
@@ -892,8 +973,10 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Jobs::default())
         .manage(Opened::default())
+        .manage(ForeignPasswords::default())
         .manage(Mutex::new(Forwarded::default()))
         .invoke_handler(tauri::generate_handler![
             core_info,
@@ -918,6 +1001,8 @@ pub fn run() {
             shell_unregister,
             set_window_mode,
             take_forwarded_args,
+            check_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nanarchive");

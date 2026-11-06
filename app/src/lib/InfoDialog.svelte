@@ -36,7 +36,7 @@
       <dd>{archive.recovery_percent > 0 ? t("info.recText", { p: Math.round(archive.recovery_percent * 10) / 10, size: bytes(archive.recovery_bytes) }) : t("info.recNone")}</dd>
       {#if archive.parts > 1}<dt>{t("info.parts")}</dt><dd>{count(archive.parts)}</dd>{/if}
     {/if}
-    <dt>{t("info.format")}</dt><dd>{archive.format === "zip" ? t("info.formatZip") : t("info.formatText")}</dd>
+    <dt>{t("info.format")}</dt><dd>{archive.format === "nax" ? t("info.formatText") : t("info.formatOther", { fmt: archive.format.toUpperCase() })}</dd>
   </dl>
 
   {#snippet footer()}
