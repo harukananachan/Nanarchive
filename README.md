@@ -32,6 +32,10 @@ nax l photos.nax                        # list contents (instant)
 nax t photos.nax                        # test: check every checksum
 nax x photos.nax -o D:\Restore          # extract (existing files are kept; -y replaces)
 nax x photos.nax "Photos/2024" -o out   # extract only some files/folders
+nax a secret.nax C:\Docs -P             # encrypt with a password (asked twice, or NAX_PASSWORD)
+nax a backup.nax C:\Data -r 5           # add a 5% recovery record
+nax a big.nax C:\Video -v 700m          # split into 700 MB parts (big.part1.nax, ...)
+nax repair backup.nax                   # fix damage using the recovery record
 ```
 
 The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
@@ -43,4 +47,5 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 - Phase 2 (benchmark + speed engine) — done; run `python -I bench\bench.py`, results in `bench/results/`
 - Phase 3 (JPEG/PNG/ZIP recompression, dedup, file-type sorting, Max tuning) — done
 - Phase 4 (desktop app: WinRAR-style file manager, English + Russian, Explorer right-click menu and .nax icon, opens ZIP) — done
-- Next: Phase 5 — encryption, recovery records, robustness
+- Phase 5 (AES-256 password encryption, recovery records + repair, split volumes, fuzzed and hardened reader) — done
+- Next: Phase 6 — Ultra mode

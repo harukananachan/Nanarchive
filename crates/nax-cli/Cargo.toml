@@ -16,4 +16,5 @@ clap.workspace = true
 indicatif = "0.18.6"
 anyhow = "1.0.104"
 ctrlc = "3.5.2"
+rpassword = "7"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

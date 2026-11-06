@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  export type JobKind = "create" | "extract" | "test";
+  export type JobKind = "create" | "extract" | "test" | "repair";
 </script>
 
 <script lang="ts">
@@ -55,6 +55,10 @@
   const saved = $derived(done?.ok && kind === "create" ? Math.max(0, done.bytes_in - done.bytes_out) : 0);
   const savedPct = $derived(done?.ok && kind === "create" && done.bytes_in > 0 ? saved / done.bytes_in : 0);
 
+  // A repair that finds too much damage (or no record) is a failure for the ring.
+  const good = $derived(!!done?.ok && !(kind === "repair" && (done.note === "too_damaged" || done.note === "no_record")));
+  const errText = (e: string | null) => (e === "password_required" ? t("pw.required") : e === "wrong_password" ? t("pw.wrong") : e);
+
   function key(e: KeyboardEvent) {
     if (e.key === "Escape" && done) onclose();
   }
@@ -64,7 +68,7 @@
 
 <div class="scrim">
   <div class="sheet card" role="dialog" aria-label={title}>
-    <div class="ring" class:done={done?.ok} class:fail={done && !done.ok}>
+    <div class="ring" class:done={good} class:fail={done && !good}>
       <svg viewBox="0 0 180 180" width="180" height="180">
         <circle cx="90" cy="90" r={R} class="bg" />
         <circle
@@ -78,7 +82,7 @@
         />
       </svg>
       <div class="center">
-        {#if done?.ok}
+        {#if good}
           <span class="tick"><Icon name="check" size={44} /></span>
         {:else if done}
           <span class="cross"><Icon name="x" size={40} /></span>
@@ -109,8 +113,22 @@
       {#if kind === "create"}
         <h2 class="big">{t("pr.saved", { size: bytes(saved) })}</h2>
         <p class="muted sub">
-          {bytes(done.bytes_in)} → <b class="acc">{bytes(done.bytes_out)}</b> · {t("smaller", { p: Math.round(savedPct * 100) })} · {duration(done.elapsed_ms)}
+          {bytes(done.bytes_in)} → <b class="acc">{bytes(done.bytes_out)}</b> · {t("smaller", { p: Math.round(savedPct * 100) })} · {duration(done.elapsed_ms)}{done.parts > 1 ? ` · ${t("pr.parts", { n: done.parts })}` : ""}
         </p>
+      {:else if kind === "repair"}
+        {#if done.note === "repaired"}
+          <h2>{t("rp.repaired", { size: bytes(done.bytes_out) })}</h2>
+          <p class="muted sub">{t("rp.repairedSub")}</p>
+        {:else if done.note === "intact"}
+          <h2>{t("rp.intact")}</h2>
+          <p class="muted sub">{t("rp.intactSub")}</p>
+        {:else if done.note === "too_damaged"}
+          <h2>{t("rp.tooMuch")}</h2>
+          <p class="sub err">{t("rp.tooMuchSub", { bad: bytes(done.bytes_out), cap: bytes(done.bytes_in) })}</p>
+        {:else}
+          <h2>{t("rp.none")}</h2>
+          <p class="muted sub">{t("rp.noneSub")}</p>
+        {/if}
       {:else if kind === "extract"}
         <h2>{t("pr.extracted", { n: count(done.files) })}</h2>
         <p class="muted sub ellipsis">
@@ -127,10 +145,10 @@
         </details>
       {/if}
       <div class="row">
-        {#if kind !== "test"}
+        {#if kind !== "test" && (kind !== "repair" || done.note === "repaired")}
           <button class="btn" onclick={onreveal}><Icon name="reveal" size={16} /> {t("pr.reveal")}</button>
         {/if}
-        {#if kind === "create"}
+        {#if kind === "create" || (kind === "repair" && done.note === "repaired")}
           <button class="btn soft" onclick={onopen}><Icon name="open" size={16} /> {t("pr.open", { name: baseName(done.output) })}</button>
         {/if}
         <button class="btn primary" onclick={onclose}>{t("done")}</button>
@@ -138,7 +156,7 @@
     {:else}
       <h2>{done.cancelled ? t("pr.cancelled") : t("pr.failed")}</h2>
       <p class="sub" class:muted={done.cancelled} class:err={!done.cancelled}>
-        {done.cancelled ? t("pr.nothing") : done.error}
+        {done.cancelled ? t("pr.nothing") : errText(done.error)}
       </p>
       <div class="row"><button class="btn primary" onclick={onclose}>{t("close")}</button></div>
     {/if}

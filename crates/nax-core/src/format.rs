@@ -1,4 +1,4 @@
-﻿//! On-disk structures of the `.nax` format. See docs/FORMAT.md.
+//! On-disk structures of the `.nax` format. See docs/FORMAT.md.
 
 use crate::varint::{Dec, Enc};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
@@ -22,14 +22,21 @@ const MAX_PROPS_LEN: usize = 256;
 const MAX_STEPS: usize = 16;
 pub const MAX_BLOCK_UNPACKED: u64 = 1 << 31; // 2 GiB
 
-pub fn header_bytes() -> [u8; HEADER_LEN as usize] {
+/// Header flag: blocks and file list are encrypted; a 64-byte encryption
+/// header follows the archive header.
+pub const FLAG_ENCRYPTED: u16 = 1;
+const KNOWN_FLAGS: u16 = FLAG_ENCRYPTED;
+
+pub fn header_bytes(flags: u16) -> [u8; HEADER_LEN as usize] {
     let mut h = [0u8; HEADER_LEN as usize];
     h[0..4].copy_from_slice(&MAGIC);
     h[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    h[6..8].copy_from_slice(&flags.to_le_bytes());
     h
 }
 
-pub fn check_header(h: &[u8]) -> Result<()> {
+/// Checks magic and version; returns the flags.
+pub fn check_header(h: &[u8]) -> Result<u16> {
     if h.len() < HEADER_LEN as usize || h[0..4] != MAGIC {
         return Err(Error::BadMagic);
     }
@@ -37,7 +44,11 @@ pub fn check_header(h: &[u8]) -> Result<()> {
     if version != FORMAT_VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
-    Ok(())
+    let flags = u16::from_le_bytes([h[6], h[7]]);
+    if flags & !KNOWN_FLAGS != 0 || h[8..16].iter().any(|&b| b != 0) {
+        return Err(Error::Corrupt("unknown archive features (made by a newer Nanarchive?)".into()));
+    }
+    Ok(flags)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

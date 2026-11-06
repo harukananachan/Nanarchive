@@ -30,6 +30,12 @@
     <dt>{t("info.archive")}</dt><dd>{bytes(archive.archive_size, 2)} <span class="muted">({t("info.bytes", { n: count(archive.archive_size) })})</span></dd>
     <dt>{t("info.methods")}</dt><dd>{archive.methods.join(", ")}</dd>
     {#if archive.format === "nax"}<dt>{t("info.blocks")}</dt><dd>{count(archive.blocks)}</dd>{/if}
+    {#if archive.format === "nax"}
+      <dt>{t("info.encryption")}</dt><dd>{archive.encrypted ? t("info.encAes") : t("info.encNone")}</dd>
+      <dt>{t("info.recovery")}</dt>
+      <dd>{archive.recovery_percent > 0 ? t("info.recText", { p: Math.round(archive.recovery_percent * 10) / 10, size: bytes(archive.recovery_bytes) }) : t("info.recNone")}</dd>
+      {#if archive.parts > 1}<dt>{t("info.parts")}</dt><dd>{count(archive.parts)}</dd>{/if}
+    {/if}
     <dt>{t("info.format")}</dt><dd>{archive.format === "zip" ? t("info.formatZip") : t("info.formatText")}</dd>
   </dl>
 

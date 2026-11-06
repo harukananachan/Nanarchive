@@ -41,6 +41,13 @@
       fill="#ffb4c8"
     />
     <circle cx="20" cy="20" r="5" fill="#fff" />
+  {:else if name === "repair"}
+    <rect x="4" y="14.5" width="32" height="11" rx="5.5" transform="rotate(-45 20 20)" fill="#ffd28f" />
+    <rect x="13.5" y="14.5" width="13" height="11" transform="rotate(-45 20 20)" fill="#ffb4c8" />
+    <circle cx="18" cy="18" r="1.3" fill="#fff" />
+    <circle cx="22" cy="18" r="1.3" fill="#fff" />
+    <circle cx="18" cy="22" r="1.3" fill="#fff" />
+    <circle cx="22" cy="22" r="1.3" fill="#fff" />
   {:else if name === "open"}
     <path d="M5 11a3 3 0 0 1 3-3h7l3 3h14a3 3 0 0 1 3 3v15a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3z" fill="#ffd28f" />
     <path d="M5 16h30v13a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3z" fill="#ffe2ab" />

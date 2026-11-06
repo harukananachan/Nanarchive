@@ -10,6 +10,7 @@
   import InfoDialog from "$lib/InfoDialog.svelte";
   import Settings from "$lib/Settings.svelte";
   import Preview from "$lib/Preview.svelte";
+  import PasswordDialog from "$lib/PasswordDialog.svelte";
   import Progress, { type JobKind } from "$lib/Progress.svelte";
   import Toasts from "$lib/Toasts.svelte";
   import {
@@ -27,6 +28,7 @@
     type DoneEvent,
     type Preset,
     type ProgressEvent,
+    type Protection,
     type Recent,
   } from "$lib/api";
   import { baseName, bytes, count, dirName, ext, fileKind } from "$lib/fmt";
@@ -58,12 +60,13 @@
   let settingsOpen = $state(false);
   let previewing = $state<{ archive: string; node: Node } | null>(null);
   let ctx = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  let askPw = $state<{ name: string; wrong: boolean; resolve: (pw: string | null) => void } | null>(null);
 
   type Job = { id: number; kind: JobKind; title: string; progress: ProgressEvent | null; done: DoneEvent | null };
   let job = $state<Job | null>(null);
   /** A queued action is getting ready (e.g. picking a folder name). */
   let starting = $state(false);
-  const blocked = $derived(!!(addFor || extractFor || infoFor || settingsOpen || previewing || job || starting));
+  const blocked = $derived(!!(addFor || extractFor || infoFor || settingsOpen || previewing || job || starting || askPw));
 
   // --- Theme ------------------------------------------------------------------
   $effect(() => {
@@ -112,10 +115,39 @@
     }
   }
 
+  // --- Passwords --------------------------------------------------------------
+  function askPassword(name: string, wrong: boolean): Promise<string | null> {
+    return new Promise((resolve) => (askPw = { name, wrong, resolve }));
+  }
+
+  function answerPassword(pw: string | null) {
+    const a = askPw;
+    askPw = null;
+    a?.resolve(pw);
+  }
+
+  /** Opens an archive, asking for its password when it has one. Null if the
+   *  user gave up. The app remembers the key until it closes (memory only). */
+  async function unlockArchive(path: string): Promise<ArchiveView | null> {
+    let pw: string | undefined;
+    for (;;) {
+      try {
+        return await api.openArchive(path, pw);
+      } catch (e) {
+        const s = String(e);
+        if (s !== "password_required" && s !== "wrong_password") throw e;
+        const got = await askPassword(baseName(path), s === "wrong_password");
+        if (got === null) return null;
+        pw = got;
+      }
+    }
+  }
+
   async function openArchive(path: string, inner = "") {
     busy = true;
     try {
-      const archive = await api.openArchive(path);
+      const archive = await unlockArchive(path);
+      if (!archive) return;
       const nodes = buildTree(archive);
       let cwd = 0;
       if (inner) {
@@ -235,6 +267,7 @@
     test: loc?.kind === "arc" || !!selNax,
     view: selRows.length > 0,
     info: loc?.kind === "arc" || !!selNax,
+    repair: loc?.kind === "arc" ? loc.archive.format === "nax" : !!selNax && isNaxName(selNax.name),
   });
 
   async function cmdAdd(paths?: string[]) {
@@ -243,16 +276,34 @@
     if (list.length) addFor = list;
   }
 
-  function cmdExtract() {
+  async function cmdExtract() {
     if (loc?.kind === "arc") {
       const only = selRows.map((r) => nodeOf(r.key)?.path).filter((p): p is string => !!p);
       extractFor = { archive: loc.archive.path, only };
-    } else if (selNax) extractFor = { archive: selNax.key, only: [] };
+    } else if (selNax) {
+      const path = selNax.key;
+      if (await unlockQuietly(path)) extractFor = { archive: path, only: [] };
+    }
   }
 
-  function cmdTest() {
+  async function cmdTest() {
     const path = loc?.kind === "arc" ? loc.archive.path : selNax?.key;
-    if (path) startJob("test", baseName(path), (id) => api.testArchive(id, path));
+    if (path && (await unlockQuietly(path))) startJob("test", baseName(path), (id) => api.testArchive(id, path));
+  }
+
+  function cmdRepair() {
+    const path = loc?.kind === "arc" ? loc.archive.path : selNax?.key;
+    if (path) startJob("repair", baseName(path), (id) => api.repairArchive(id, path));
+  }
+
+  /** Unlock before a job; shows errors as a toast. */
+  async function unlockQuietly(path: string) {
+    try {
+      return !!(await unlockArchive(path));
+    } catch (e) {
+      toast(t("err.open", { name: baseName(path), e: String(e) }), "error", 6000);
+      return false;
+    }
   }
 
   function cmdView() {
@@ -264,7 +315,7 @@
     if (loc?.kind === "arc") infoFor = loc.archive;
     else if (selNax) {
       try {
-        infoFor = await api.openArchive(selNax.key);
+        infoFor = await unlockArchive(selNax.key);
       } catch (e) {
         toast(String(e), "error");
       }
@@ -299,14 +350,14 @@
     job = { id, kind, title, progress: null, done: null };
     run(id).catch((e) => {
       if (job?.id === id)
-        job.done = { job: id, ok: false, cancelled: false, error: String(e), output: "", files: 0, bytes_in: 0, bytes_out: 0, skipped: 0, warnings: [], elapsed_ms: 0 };
+        job.done = { job: id, ok: false, cancelled: false, error: String(e), output: "", files: 0, bytes_in: 0, bytes_out: 0, skipped: 0, warnings: [], elapsed_ms: 0, parts: 0, note: null };
     });
   }
 
-  function startAdd(dest: string, preset: Preset, overwrite: boolean) {
+  function startAdd(dest: string, preset: Preset, overwrite: boolean, protection: Protection) {
     const inputs = addFor ?? [];
     addFor = null;
-    startJob("create", baseName(dest), (id) => api.createArchive(id, dest, inputs, preset, overwrite));
+    startJob("create", baseName(dest), (id) => api.createArchive(id, dest, inputs, preset, overwrite, protection));
   }
 
   function startExtract(dest: string, overwrite: boolean) {
@@ -387,7 +438,8 @@
         case "--add-quick": {
           const dest = await api.suggestArchivePath(paths);
           const preset = settings.preset;
-          whenFree(() => startJob("create", baseName(dest), (id) => api.createArchive(id, dest, paths, preset, false)));
+          const none: Protection = { password: null, recovery: settings.recovery, volume: null };
+          whenFree(() => startJob("create", baseName(dest), (id) => api.createArchive(id, dest, paths, preset, false, none)));
           break;
         }
         case "--extract-here":
@@ -397,6 +449,7 @@
             whenFree(async () => {
               starting = true;
               try {
+                if (!(await unlockArchive(p))) return;
                 const dest = g.flag === "--extract-here" ? dirName(p) : await api.suggestExtractDir(p);
                 startJob("extract", `${baseName(p)} → ${dest}`, (id) => api.extractArchive(id, p, dest, [], false));
               } catch (e) {
@@ -408,7 +461,17 @@
           }
           break;
         case "--test":
-          for (const p of paths) whenFree(() => startJob("test", baseName(p), (id) => api.testArchive(id, p)));
+          for (const p of paths)
+            whenFree(async () => {
+              starting = true;
+              try {
+                if (await unlockArchive(p)) startJob("test", baseName(p), (id) => api.testArchive(id, p));
+              } catch (e) {
+                toast(String(e), "error", 6000);
+              } finally {
+                starting = false;
+              }
+            });
           break;
         default:
           if (quick) await leaveQuick();
@@ -452,6 +515,7 @@
         { label: t("m.add"), shortcut: "Alt+A", action: () => cmdAdd(), disabled: !can.add },
         { label: t("m.extract"), shortcut: "Alt+E", action: cmdExtract, disabled: !can.extract },
         { label: t("m.test"), shortcut: "Alt+T", action: cmdTest, disabled: !can.test },
+        { label: t("m.repair"), shortcut: "Alt+R", action: cmdRepair, disabled: !can.repair },
         { label: t("m.view"), shortcut: "Alt+V", action: cmdView, disabled: !can.view },
         { sep: true },
         { label: t("m.find"), shortcut: "Ctrl+F", action: cmdFind },
@@ -486,6 +550,7 @@
     if (loc.kind === "disk" && selRows.length) items.push({ label: t("ctx.addTo"), action: () => cmdAdd() });
     if (can.extract) items.push({ label: t("m.extract"), action: cmdExtract });
     if (can.test) items.push({ label: t("m.test"), action: cmdTest });
+    if (can.repair) items.push({ label: t("m.repair"), action: cmdRepair });
     if (can.info) items.push({ label: t("m.info"), action: cmdInfo });
     if (loc.kind === "disk" && r && r.icon !== "up" && r.icon !== "drive")
       items.push({ sep: true }, { label: t("ctx.reveal"), action: () => reveal(r.key) });
@@ -500,7 +565,7 @@
     const inInput = (e.target as HTMLElement).tagName === "INPUT";
     const k = e.key.toLowerCase();
     const shortcuts: Record<string, () => void> = {};
-    if (e.altKey) Object.assign(shortcuts, { a: () => can.add && cmdAdd(), e: () => can.extract && cmdExtract(), t: () => can.test && cmdTest(), v: () => can.view && cmdView(), i: () => can.info && cmdInfo() });
+    if (e.altKey) Object.assign(shortcuts, { a: () => can.add && cmdAdd(), e: () => can.extract && cmdExtract(), t: () => can.test && cmdTest(), v: () => can.view && cmdView(), i: () => can.info && cmdInfo(), r: () => can.repair && cmdRepair() });
     if (e.ctrlKey) Object.assign(shortcuts, { o: cmdOpen, f: cmdFind });
     if (shortcuts[k]) {
       e.preventDefault();
@@ -605,6 +670,9 @@
     <button class="tb" onclick={cmdTest} disabled={!can.test} title={t("tip.test")}>
       <ToolIcon name="test" /><span>{t("tb.test")}</span>
     </button>
+    <button class="tb" onclick={cmdRepair} disabled={!can.repair} title={t("tip.repair")}>
+      <ToolIcon name="repair" /><span>{t("tb.repair")}</span>
+    </button>
     <button class="tb" onclick={cmdView} disabled={!can.view} title={t("tip.view")}>
       <ToolIcon name="view" /><span>{t("tb.view")}</span>
     </button>
@@ -676,6 +744,8 @@
     {#if loc?.kind === "arc"}
       {@const a = loc.archive}
       <span class="right">
+        {#if a.encrypted}<span class="pill lock" title={t("info.encAes")}><Icon name="lock" size={12} /> AES-256</span>{/if}
+        {#if a.recovery_percent > 0}<span class="pill shield" title={t("info.recovery")}><Icon name="shield" size={12} /> {Math.round(a.recovery_percent)}%</span>{/if}
         <span class="pill">{t("smaller", { p: a.total_size ? Math.round((1 - a.archive_size / a.total_size) * 100) : 0 })}</span>
         {t("status.files", { n: count(a.files) })} · {a.methods.join(", ")}
       </span>
@@ -699,6 +769,9 @@
   {/if}
   {#if extractFor}
     <ExtractDialog archive={extractFor.archive} only={extractFor.only} onstart={startExtract} onclose={() => (extractFor = null)} />
+  {/if}
+  {#if askPw}
+    <PasswordDialog name={askPw.name} wrong={askPw.wrong} onsubmit={(pw) => answerPassword(pw)} onclose={() => answerPassword(null)} />
   {/if}
   {#if infoFor}
     <InfoDialog archive={infoFor} onclose={() => (infoFor = null)} />
@@ -996,6 +1069,15 @@
     background: var(--ok-soft);
     color: var(--ok);
     font-weight: 600;
+  }
+  .pill.lock,
+  .pill.shield {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-right: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
   }
 
   .ctx {

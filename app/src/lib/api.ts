@@ -24,6 +24,10 @@ export type ArchiveView = {
   blocks: number;
   methods: string[];
   format: "nax" | "zip";
+  encrypted: boolean;
+  recovery_percent: number;
+  recovery_bytes: number;
+  parts: number;
   paths: string[];
   sizes: number[];
   is_dir: boolean[];
@@ -34,7 +38,7 @@ export type Recent = { path: string; size: number; opened: number };
 
 export type ProgressEvent = {
   job: number;
-  phase: "scanning" | "compressing" | "finishing" | "extracting" | "testing";
+  phase: "scanning" | "compressing" | "finishing" | "extracting" | "testing" | "protecting" | "repairing";
   bytes_done: number;
   bytes_total: number;
   packed_bytes: number;
@@ -54,7 +58,12 @@ export type DoneEvent = {
   skipped: number;
   warnings: string[];
   elapsed_ms: number;
+  parts: number;
+  note: "intact" | "repaired" | "too_damaged" | "no_record" | null;
 };
+
+/** Password, recovery record and splitting for a new archive. */
+export type Protection = { password: string | null; recovery: number; volume: number | null };
 
 export type PreviewView = {
   kind: "image" | "text" | "none";
@@ -99,11 +108,12 @@ export const api = {
   suggestArchivePath: (inputs: string[]) => call<string>("suggest_archive_path", { inputs }),
   suggestExtractDir: (archive: string) => call<string>("suggest_extract_dir", { archive }),
   estimate: (inputs: string[]) => call<Estimate>("estimate", { inputs }),
-  openArchive: (path: string) => call<ArchiveView>("open_archive", { path }),
+  openArchive: (path: string, password?: string) => call<ArchiveView>("open_archive", { path, password: password ?? null }),
   recentList: () => call<Recent[]>("recent_list"),
   recentRemove: (path: string) => call<void>("recent_remove", { path }),
-  createArchive: (job: number, dest: string, inputs: string[], preset: Preset, overwrite: boolean) =>
-    call<void>("create_archive", { job, dest, inputs, preset, overwrite }),
+  createArchive: (job: number, dest: string, inputs: string[], preset: Preset, overwrite: boolean, p: Protection) =>
+    call<void>("create_archive", { job, dest, inputs, preset, overwrite, password: p.password, recovery: p.recovery, volume: p.volume }),
+  repairArchive: (job: number, archive: string) => call<void>("repair_archive", { job, archive }),
   extractArchive: (job: number, archive: string, dest: string, only: string[], overwrite: boolean) =>
     call<void>("extract_archive", { job, archive, dest, only, overwrite }),
   testArchive: (job: number, archive: string) => call<void>("test_archive", { job, archive }),
@@ -252,6 +262,10 @@ function mockArchive(path: string): ArchiveView {
     dirs: 4,
     blocks: 9,
     methods: ["lzma2", "recompress"],
+    encrypted: /secret/i.test(path),
+    recovery_percent: /secret/i.test(path) ? 5 : 0,
+    recovery_bytes: 2_100_000,
+    parts: 1,
     format: /\.zip$/i.test(path) ? "zip" : "nax",
     paths,
     sizes,
@@ -266,7 +280,7 @@ let mockRecent: Recent[] = [
   { path: "C:\\Users\\demo\\Desktop\\thesis.nax", size: 6_300_000, opened: Date.now() - 86_400_000 * 9 },
 ];
 
-function mockJob(job: number, phase: ProgressEvent["phase"], total: number, ratio: number, output: string) {
+function mockJob(job: number, phase: ProgressEvent["phase"], total: number, ratio: number, output: string, note: DoneEvent["note"] = null) {
   let done = 0;
   const files = 1244;
   const t0 = Date.now();
@@ -295,6 +309,8 @@ function mockJob(job: number, phase: ProgressEvent["phase"], total: number, rati
         skipped: 0,
         warnings: [],
         elapsed_ms: Date.now() - t0,
+        parts: 1,
+        note,
       });
     }
   }, 50);
@@ -346,7 +362,12 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
       return { files: 1244 * a.inputs.length, dirs: 31, bytes, sizes: [1.0, 0.31, 0.215, 0.205, 0.196].map((f) => Math.round(bytes * f)), seconds: [0.5, 1, 5, 12, 38] };
     }
     case "open_archive":
+      // Demo: archives with "secret" in the name are locked with the password "demo".
+      if (/secret/i.test(a.path) && a.password !== "demo") throw a.password ? "wrong_password" : "password_required";
       return mockArchive(a.path);
+    case "repair_archive":
+      mockJob(a.job, "repairing", 40_000_000, 1, String(a.archive).replace(/\.nax$/i, ".repaired.nax"), "repaired");
+      return;
     case "recent_list":
       return mockRecent;
     case "recent_remove":
@@ -363,7 +384,7 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
       return;
     case "cancel_job": {
       clearInterval(mockJobs.get(a.job));
-      emit("job-done", { job: a.job, ok: false, cancelled: true, error: "cancelled", output: "", files: 0, bytes_in: 0, bytes_out: 0, skipped: 0, warnings: [], elapsed_ms: 0 });
+      emit("job-done", { job: a.job, ok: false, cancelled: true, error: "cancelled", output: "", files: 0, bytes_in: 0, bytes_out: 0, skipped: 0, warnings: [], elapsed_ms: 0, parts: 0, note: null });
       return;
     }
     case "preview":

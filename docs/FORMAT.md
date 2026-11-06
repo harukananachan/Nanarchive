@@ -1,4 +1,4 @@
-﻿# `.nax` format, version 1 (index version 2)
+# `.nax` format, version 1 (index version 2)
 
 All integers are little-endian. `varint` = unsigned LEB128 (7 bits per byte, low bits first,
 max 10 bytes). `ivarint` = zigzag-encoded signed varint.
@@ -23,7 +23,7 @@ max 10 bytes). `ivarint` = zigzag-encoded signed varint.
 |---|---|
 | 4 | magic `NANA` |
 | 2 | format version (`1`) |
-| 2 | flags (0, reserved for encryption etc.) |
+| 2 | flags: bit 0 = encrypted (`FLAG_ENCRYPTED`); other bits must be 0 |
 | 8 | reserved, zero |
 
 ## Footer (64 bytes, at the very end)
@@ -133,6 +133,82 @@ repeat (files): 8 B                       first 8 bytes of the BLAKE3 hash of th
 ```
 
 Path = `folder + "/" + name` (or just `name` at the top level): UTF-8, `/` separators, relative.
+
+## Encryption (header flag bit 0)
+
+An encrypted archive has a 64-byte **encryption header** right after the header, so blocks start
+at offset 80 instead of 16.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | KDF id (`1` = Argon2id) |
+| 1 | 1 | cipher id (`1` = AES-256-GCM) |
+| 2 | 1 | Argon2 lanes `p` (1–64) |
+| 3 | 1 | zero |
+| 4 | 4 | Argon2 memory in KiB `m` (up to 2 GiB) |
+| 8 | 4 | Argon2 passes `t` (1–32) |
+| 12 | 16 | random salt (new for every archive) |
+| 28 | 16 | password check value |
+| 44 | 20 | zero |
+
+- `master = Argon2id(password, salt, m, t, p)` (32 bytes). Defaults: 128 MiB, 3 passes, 4 lanes.
+- `key = BLAKE3.derive_key("Nanarchive 2026-11 data key", master)`,
+  `check = BLAKE3.derive_key("Nanarchive 2026-11 password check", master)[..16]`.
+  A wrong password is detected by `check` without touching any data.
+- Every packed block, and the zstd-compressed index, is sealed with AES-256-GCM and stored as
+  `ciphertext || 16-byte tag`. Nonce (12 B) = `purpose u32 LE || counter u64 LE`: purpose 1 =
+  block (counter = block number), purpose 2 = index (counter 0). Blocks can't be swapped or reused.
+- Associated data = header (16 B) + encryption header (64 B), so changing the flags, KDF settings
+  or salt makes every block fail.
+- Block hashes in the index and the index hash in the footer cover the stored (encrypted) bytes,
+  so `test` and repair work without the password. File names and sizes are inside the encrypted
+  index and stay hidden. The footer repeats the flags.
+
+## Split archives (volumes)
+
+A split archive is one `.nax` byte stream cut into parts of equal size (the last may be shorter):
+`name.part1.nax`, `name.part2.nax`, … (numbers zero-padded to the same width, e.g. `part01`).
+The reader joins the parts in order; a missing part is reported by number. An archive that fits
+into one part is written as plain `name.nax`.
+
+## Recovery record (optional)
+
+Reed–Solomon parity (GF(2^16), `reed-solomon-simd`) over everything before it — header, blocks,
+index and footer, `protected_len` bytes. It is appended after the footer:
+
+```
+[header] [parity] [header again] [trailer 48 B]
+```
+
+The protected data is split into `N` data shards of `S` bytes (last one zero-padded), with
+`S = max(4096, ceil(L / 16384))` rounded up to 64 and `N <= 16384`. There are
+`R = ceil(N * percent / 100)` parity shards (1..N). Shards are coded in column slices of width
+`W` bytes (`W = floor(256 MiB / (N + R))` rounded down to 64, clamped to 64..S) to keep memory low;
+parity is stored slice by slice. Up to `R` damaged or missing shards can be rebuilt.
+
+**Header** (both copies identical):
+
+```
+8 B   magic "NAXRECV1"
+u64   protected_len
+u32   shard size S
+u32   data shards N
+u32   parity shards R
+u32   slice width W
+16 B  x (N + R)   BLAKE3 of each shard, first 16 bytes (data shards, then parity shards)
+32 B  BLAKE3 of everything above
+```
+
+**Trailer** (last 48 bytes): magic `NAXRTAIL`, `protected_len`, `S`, `N`, `R` (as above), 12 zero
+bytes, then 8 bytes of BLAKE3 over the first 40 bytes.
+
+A normal reader uses the trailer only to know where the archive itself ends. Repair finds a header
+through the trailer or, if the trailer is damaged, by scanning for `NAXRECV1` at a position that is
+consistent with its fields; it checks every shard and writes a new `name.repaired.nax` (or
+`.repaired.partN.nax` for split archives). The original is never modified. In a split archive the
+record spans the parts like the rest of the data, so a whole lost part can be rebuilt when the
+record is large enough.
+
 ## Safety rules for readers
 
 - Check magic, version, index hash and every block hash before trusting data.
@@ -140,3 +216,10 @@ Path = `folder + "/" + name` (or just `name` at the top level): UTF-8, `/` separ
 - Paths are validated before writing: no absolute paths, drive letters, `..`, reserved Windows
   names (`CON`, `NUL`, …) or forbidden characters. Unsafe paths are refused.
 - Decompression output is limited to the declared size.
+- Unknown header flags or non-zero reserved bytes are refused. KDF settings read from an archive
+  are capped (memory 2 GiB, 32 passes, 64 lanes) so a crafted file can't exhaust the machine.
+- Extraction resolves each parent folder and requires it to stay inside the destination, so
+  junctions or symlinks planted there can't redirect writes; existing symlinks are replaced,
+  never written through.
+- The reader is fuzzed (`cargo run --release -p nax-core --example fuzz -- <secs> <dir>`):
+  damaged archives must give errors, never panics or writes outside the destination.

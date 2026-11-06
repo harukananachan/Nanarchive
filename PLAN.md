@@ -150,8 +150,16 @@ toggle in Settings), quick actions that run in a small window and close when don
 sends), opening ZIP / JAR (browse, preview, extract, test). Time estimate uses measured speeds per
 file type (JPEG and PNG/ZIP recompression are much slower than plain data on Max / Ultra).
 
-**Phase 5 — Security & robustness**
-Encryption, recovery records, split volumes, fuzz testing the reader, path-safety checks.
+**Phase 5 — Security & robustness** ✅ done
+- Password encryption: AES-256-GCM, Argon2id key (128 MiB, 3 passes), file names hidden,
+  every block authenticated; wrong password detected instantly.
+- Recovery record (Reed–Solomon, 1–10% in the app, any % in the CLI) and Repair: rebuilds damaged
+  bytes, cut-off archives and lost parts into a new `.repaired.nax`, never touching the original.
+- Split archives into volumes (`name.part1.nax` …).
+- Hardened reader: strict header checks, KDF limits, junction/symlink-safe extraction, ZIP-bomb
+  guard in the ZIP reader; mutation fuzzer (about 740,000 damaged inputs, 0 panics).
+- CLI: `-P` password, `-r` recovery %, `-v` volume size, `nax repair`. App: protection options in
+  Add, password prompt, Repair button, Info rows, status bar pills.
 
 **Phase 6 — Ultra mode: beat 7z and WinRAR on everything**
 Goal: Ultra is smaller than 7z Ultra **and** WinRAR Best on every category of the benchmark

@@ -1,4 +1,4 @@
-﻿//! Opening, listing, extracting and testing `.nax` archives.
+//! Opening, listing, extracting and testing `.nax` archives.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -10,6 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::codec::{self, Partial};
+use crate::crypto::{Cipher, CryptHeader, CRYPT_HEADER_LEN};
+use crate::recovery::{self, RecoveryInfo, TRAILER_LEN};
+use crate::volume::{VolReader, VolSet};
 use crate::format::{self, BlockInfo, Entry, Footer, Index, FOOTER_LEN, HEADER_LEN};
 use crate::history::History;
 use crate::fsmeta::{self, ATTR_HIDDEN, ATTR_READONLY, ATTR_SYSTEM};
@@ -62,11 +65,13 @@ pub struct TestStats {
 
 /// An opened `.nax` archive. Opening reads only the header, footer and file list.
 pub struct Archive {
-    path: PathBuf,
+    set: VolSet,
     index: Index,
     archive_size: u64,
     /// Bytes of earlier data to keep while decoding (0 = blocks are independent).
     hist_keep: u64,
+    cipher: Option<Cipher>,
+    recovery: Option<RecoveryInfo>,
 }
 
 struct Active {
@@ -80,32 +85,103 @@ struct RunStats {
     files: u64,
     bytes: u64,
     skipped: u64,
+    guard: Guard,
+}
+
+/// Makes sure every folder we write into really is inside the destination,
+/// even if a link or junction was planted there (`dest/sub` -> `C:\Windows`).
+#[derive(Default)]
+struct Guard {
+    root: Option<PathBuf>,
+    checked: std::collections::HashSet<PathBuf>,
+}
+
+impl Guard {
+    fn check(&mut self, dest: &Path, dir: &Path) -> Result<()> {
+        if self.checked.contains(dir) {
+            return Ok(());
+        }
+        if self.root.is_none() {
+            self.root = Some(fs::canonicalize(dest).map_err(|e| Error::file(dest, e))?);
+        }
+        let real = fs::canonicalize(dir).map_err(|e| Error::file(dir, e))?;
+        if !real.starts_with(self.root.as_ref().unwrap()) {
+            return Err(Error::UnsafePath(format!("{} leads outside the destination folder (link or junction)", dir.display())));
+        }
+        self.checked.insert(dir.to_path_buf());
+        Ok(())
+    }
 }
 
 impl Archive {
+    /// Opens an archive (any part of a split one). Encrypted archives fail
+    /// with [`Error::PasswordRequired`]; use [`Archive::open_with`].
     pub fn open(path: impl AsRef<Path>) -> Result<Archive> {
+        Archive::open_with(path, None)
+    }
+
+    /// Opens an archive, decrypting it with `password` if it is encrypted.
+    pub fn open_with(path: impl AsRef<Path>, password: Option<&str>) -> Result<Archive> {
         let path = path.as_ref().to_path_buf();
-        let io = |e| Error::file(&path, e);
-        let mut f = File::open(&path).map_err(io)?;
-        let len = f.metadata().map_err(io)?.len();
+        let set = VolSet::open(&path)?;
+        let first = set.first().to_path_buf();
+        let io = |e| Error::file(&first, e);
+        let mut f = set.reader();
+        let total = set.len();
 
         let mut header = [0u8; HEADER_LEN as usize];
         let n = read_up_to(&mut f, &mut header).map_err(io)?;
         if n < 4 || header[0..4] != MAGIC {
             return Err(Error::BadMagic);
         }
-        if len < HEADER_LEN + FOOTER_LEN {
+        set.require_complete()?;
+        if total < HEADER_LEN + FOOTER_LEN {
             return Err(Error::Corrupt("file is too short (truncated?)".into()));
         }
-        format::check_header(&header)?;
+        let flags = format::check_header(&header)?;
+
+        // A recovery record sits after the footer; its trailer says where the archive ends.
+        let mut recovery = None;
+        let mut len = total;
+        if total >= TRAILER_LEN + HEADER_LEN + FOOTER_LEN {
+            let mut t = [0u8; TRAILER_LEN as usize];
+            f.seek(SeekFrom::Start(total - TRAILER_LEN)).map_err(io)?;
+            f.read_exact(&mut t).map_err(io)?;
+            if let Some(info) = recovery::read_trailer(&t, total) {
+                len = info.protected_len;
+                recovery = Some(info);
+            }
+        }
+
+        let mut data_start = HEADER_LEN;
+        let mut cipher = None;
+        if flags & format::FLAG_ENCRYPTED != 0 {
+            let mut ch = [0u8; CRYPT_HEADER_LEN as usize];
+            f.seek(SeekFrom::Start(HEADER_LEN)).map_err(io)?;
+            f.read_exact(&mut ch).map_err(io)?;
+            let parsed = CryptHeader::parse(&ch)?;
+            let pw = password.ok_or(Error::PasswordRequired)?;
+            let mut c = Cipher::open(pw, &parsed)?;
+            let mut head = header.to_vec();
+            head.extend_from_slice(&ch);
+            c.bind(&head);
+            cipher = Some(c);
+            data_start += CRYPT_HEADER_LEN;
+        }
+        if len < data_start + FOOTER_LEN {
+            return Err(Error::Corrupt("file is too short (truncated?)".into()));
+        }
 
         let mut fb = [0u8; FOOTER_LEN as usize];
         f.seek(SeekFrom::Start(len - FOOTER_LEN)).map_err(io)?;
         f.read_exact(&mut fb).map_err(io)?;
-        let footer = Footer::parse(&fb)?;
+        let footer = Footer::parse(&fb).map_err(|e| match (&e, &recovery) {
+            (Error::Corrupt(_), None) => Error::Corrupt("footer not found (file truncated or damaged; if it has a recovery record, try Repair)".into()),
+            _ => e,
+        })?;
 
         let index_end = len - FOOTER_LEN;
-        if footer.index_offset < HEADER_LEN
+        if footer.index_offset < data_start
             || footer.index_offset.checked_add(footer.index_packed_len) != Some(index_end)
             || footer.index_packed_len > MAX_INDEX_LEN
             || footer.index_raw_len > MAX_INDEX_LEN
@@ -118,12 +194,15 @@ impl Archive {
         if blake3::hash(&packed).as_bytes() != &footer.index_hash {
             return Err(Error::Corrupt("file list checksum mismatch".into()));
         }
+        if let Some(c) = &cipher {
+            packed = c.open_index(packed)?;
+        }
         let raw = zstd::bulk::decompress(&packed, footer.index_raw_len as usize)
             .map_err(|e| Error::Corrupt(format!("file list: {e}")))?;
         if raw.len() as u64 != footer.index_raw_len {
             return Err(Error::Corrupt("file list has wrong size".into()));
         }
-        let index = Index::decode(&raw, HEADER_LEN, footer.index_offset)?;
+        let index = Index::decode(&raw, data_start, footer.index_offset)?;
         let mut reach = 0u64;
         let mut max_block = 0u64;
         for b in &index.blocks {
@@ -131,11 +210,31 @@ impl Archive {
             max_block = max_block.max(b.unpacked_size);
         }
         let hist_keep = if reach > 0 { reach + max_block } else { 0 };
-        Ok(Archive { path, index, archive_size: len, hist_keep })
+        Ok(Archive { set, index, archive_size: total, hist_keep, cipher, recovery })
     }
 
+    /// The archive file (the first part of a split archive).
     pub fn path(&self) -> &Path {
-        &self.path
+        self.set.first()
+    }
+
+    /// All files of the archive (one, or every part).
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.set.paths().map(Path::to_path_buf).collect()
+    }
+
+    /// Number of parts (1 for a normal archive).
+    pub fn parts(&self) -> usize {
+        self.set.part_count()
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    /// The recovery record, if the archive has one.
+    pub fn recovery(&self) -> Option<RecoveryInfo> {
+        self.recovery
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -180,9 +279,11 @@ impl Archive {
         fs::create_dir_all(dest).map_err(|e| Error::file(dest, e))?;
 
         let mut dirs: Vec<usize> = selected.iter().copied().filter(|&i| entries[i].is_dir()).collect();
+        let mut guard = Guard::default();
         for &i in &dirs {
             let p = paths::safe_join(dest, &entries[i].path)?;
             fs::create_dir_all(&p).map_err(|e| Error::file(&p, e))?;
+            guard.check(dest, &p)?;
         }
         let files: Vec<usize> = selected.iter().copied().filter(|&i| !entries[i].is_dir()).collect();
         let cancel = opts.cancel.as_deref();
@@ -315,7 +416,7 @@ impl Archive {
         };
         progress(&report);
 
-        let mut stats = RunStats { files: 0, bytes: 0, skipped: 0 };
+        let mut stats = RunStats { files: 0, bytes: 0, skipped: 0, guard: Guard::default() };
 
         // Empty files need no data.
         for &i in order.iter().filter(|&&i| entries[i].size == 0) {
@@ -378,8 +479,23 @@ impl Archive {
         let path = paths::safe_join(dest, &e.path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| Error::file(parent, err))?;
+            stats.guard.check(dest, parent)?;
         }
         if let Ok(meta) = fs::symlink_metadata(&path) {
+            // Never write *through* an existing link: replace the link itself.
+            if meta.file_type().is_symlink() {
+                if overwrite == Overwrite::Replace {
+                    fs::remove_file(&path).or_else(|_| fs::remove_dir(&path)).map_err(|err| Error::file(&path, err))?;
+                } else if overwrite == Overwrite::Skip {
+                    stats.skipped += 1;
+                    return Ok(active);
+                } else {
+                    return Err(Error::AlreadyExists(path));
+                }
+                let f = File::create(&path).map_err(|err| Error::file(&path, err))?;
+                active.out = Some((path, BufWriter::with_capacity(256 * 1024, f)));
+                return Ok(active);
+            }
             match overwrite {
                 Overwrite::Skip => {
                     stats.skipped += 1;
@@ -433,14 +549,18 @@ impl Archive {
     }
 
     /// Reads, verifies and (where possible) decompresses one block.
-    fn read_block(&self, file: &mut File, b: usize) -> Result<Partial> {
+    fn read_block(&self, file: &mut VolReader, b: usize) -> Result<Partial> {
         let blk = &self.index.blocks[b];
-        let io = |e| Error::file(&self.path, e);
+        let io = |e| Error::file(self.path(), e);
         file.seek(SeekFrom::Start(blk.offset)).map_err(io)?;
         let mut packed = vec![0u8; blk.packed_size as usize];
         file.read_exact(&mut packed).map_err(io)?;
         if blake3::hash(&packed).as_bytes() != &blk.hash {
-            return Err(Error::Corrupt(format!("block {b} checksum mismatch")));
+            let hint = if self.recovery.is_some() { " (the archive has a recovery record: try Repair)" } else { "" };
+            return Err(Error::Corrupt(format!("block {b} checksum mismatch{hint}")));
+        }
+        if let Some(c) = &self.cipher {
+            packed = c.open_block(b as u64, packed)?;
         }
         codec::decode_start(&blk.chain, packed, blk.unpacked_size as usize)
     }
@@ -487,7 +607,7 @@ impl Archive {
                 let tx = tx.clone();
                 let (next_job, stop, gate) = (&next_job, &stop, &gate);
                 s.spawn(move || {
-                    let mut file: Option<File> = None;
+                    let mut file: Option<VolReader> = None;
                     loop {
                         let j = next_job.fetch_add(1, Relaxed);
                         if j >= needed.len() {
@@ -502,16 +622,7 @@ impl Archive {
                         if stop.load(Relaxed) {
                             break;
                         }
-                        let f = match &mut file {
-                            Some(f) => f,
-                            None => match File::open(&self.path) {
-                                Ok(f) => file.insert(f),
-                                Err(e) => {
-                                    let _ = tx.send((j, Err(Error::file(&self.path, e))));
-                                    break;
-                                }
-                            },
-                        };
+                        let f = file.get_or_insert_with(|| self.set.reader());
                         if tx.send((j, self.read_block(f, needed[j]))).is_err() {
                             break;
                         }
@@ -551,7 +662,7 @@ impl Archive {
     }
 }
 
-fn read_up_to(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_up_to(f: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match f.read(&mut buf[n..])? {

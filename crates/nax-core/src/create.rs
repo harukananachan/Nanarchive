@@ -1,13 +1,12 @@
-﻿//! Creating `.nax` archives.
+//! Creating `.nax` archives.
 //!
 //! Pipeline: one reader thread concatenates file contents into blocks,
 //! N worker threads compress blocks in parallel, and the calling thread
 //! writes finished blocks to disk in order.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{self, SyncSender};
@@ -18,7 +17,9 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use crate::codec::{self, Method};
-use crate::format::{self, BlockInfo, Entry, EntryKind, Footer, Index, Step, HEADER_LEN};
+use crate::crypto::{Cipher, KdfParams};
+use crate::volume::{self, VolWriter};
+use crate::format::{self, BlockInfo, Entry, EntryKind, Footer, Index, Step};
 use crate::history::History;
 use crate::ldm::LdmEncoder;
 use crate::preset::pick_threads;
@@ -37,6 +38,14 @@ pub struct CreateOptions {
     pub overwrite: bool,
     /// Set to true from another thread to stop early.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Encrypt contents and file names with this password (AES-256).
+    pub password: Option<String>,
+    /// Key derivation cost (default: [`KdfParams::default`]).
+    pub kdf: Option<KdfParams>,
+    /// Add a recovery record of this size, in percent of the archive (0 = none).
+    pub recovery_percent: f64,
+    /// Split into parts of this many bytes (`name.part1.nax`, ...).
+    pub volume_size: Option<u64>,
 }
 
 /// Result of a successful [`create`].
@@ -53,6 +62,9 @@ pub struct CreateStats {
     /// Files that were skipped (unreadable, symlinks, …).
     pub warnings: Vec<String>,
     pub elapsed: Duration,
+    /// Files written: the archive, or its parts.
+    pub outputs: Vec<PathBuf>,
+    pub recovery: Option<crate::RecoveryInfo>,
 }
 
 struct Item {
@@ -168,32 +180,45 @@ pub fn create(
         return Err(Error::InvalidInput("nothing to add".into()));
     }
     let archive = std::path::absolute(archive)?;
-    if archive.exists() && !opts.overwrite {
-        return Err(Error::AlreadyExists(archive));
+    if !opts.overwrite {
+        if archive.exists() {
+            return Err(Error::AlreadyExists(archive));
+        }
+        if opts.volume_size.is_some() {
+            if let Some(p) = volume::existing_parts(&archive).into_iter().next() {
+                return Err(Error::AlreadyExists(p));
+            }
+        }
     }
-    let tmp = tmp_path(&archive);
+    if let Some(pw) = &opts.password {
+        if pw.is_empty() {
+            return Err(Error::InvalidInput("the password is empty".into()));
+        }
+    }
+    if !(0.0..=100.0).contains(&opts.recovery_percent) {
+        return Err(Error::InvalidInput("recovery record must be 0-100%".into()));
+    }
     let cancel = opts.cancel.clone().unwrap_or_default();
-
-    let result = create_inner(&archive, &tmp, inputs, opts, &cancel, progress).and_then(|stats| {
-        fs::rename(&tmp, &archive).map_err(|e| Error::file(&archive, e))?;
-        Ok(stats)
-    });
-    match result {
-        Ok(mut stats) => {
-            stats.elapsed = start.elapsed();
-            Ok(stats)
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    // Temporary files are removed by VolWriter if anything fails.
+    let mut out = VolWriter::new(&archive, opts.volume_size)?;
+    let mut stats = create_inner(&archive, &mut out, inputs, opts, &cancel, progress)?;
+    stats.outputs = out.finish(opts.overwrite)?;
+    stats.archive_size = stats.outputs.iter().map(|p| fs::metadata(p).map_or(0, |m| m.len())).sum();
+    stats.elapsed = start.elapsed();
+    Ok(stats)
 }
 
-fn tmp_path(archive: &Path) -> PathBuf {
-    let mut name = archive.file_name().map(OsString::from).unwrap_or_default();
-    name.push(".tmp");
-    archive.with_file_name(name)
+/// True for the archive being written and its temporary files (they must
+/// not be added to themselves).
+fn is_own_output(archive: &Path, p: &Path) -> bool {
+    if path_key(p) == path_key(archive) || p.parent() != archive.parent() {
+        return path_key(p) == path_key(archive);
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let own = archive.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let stem = archive.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    name == format!("{own}.tmp")
+        || (name.starts_with(&format!("{stem}.part")) && (name.ends_with(".tmp") || volume::split_name(p).is_some()))
 }
 
 fn path_key(p: &Path) -> String {
@@ -202,7 +227,7 @@ fn path_key(p: &Path) -> String {
 
 fn create_inner(
     archive: &Path,
-    tmp: &Path,
+    out: &mut VolWriter,
     inputs: &[PathBuf],
     opts: &CreateOptions,
     cancel: &Arc<AtomicBool>,
@@ -219,7 +244,7 @@ fn create_inner(
     progress(&report);
 
     let mut warnings = Vec::new();
-    let items = scan(inputs, &[archive, tmp], &mut warnings, cancel)?;
+    let items = scan(inputs, &|p| is_own_output(archive, p), &mut warnings, cancel)?;
 
     // Folders first, then files grouped by extension, then by path (files
     // of one folder tend to be alike), so similar data ends up together.
@@ -249,9 +274,24 @@ fn create_inner(
     report.files_total = file_ids.len() as u64;
     progress(&report);
 
-    let file = File::create(tmp).map_err(|e| Error::file(tmp, e))?;
-    let mut out = BufWriter::with_capacity(1 << 20, file);
-    out.write_all(&format::header_bytes()).map_err(|e| Error::file(tmp, e))?;
+    let io = |e| Error::file(archive, e);
+    // Encryption: random salt, key from the password; the header (with the
+    // salt and settings) is authenticated with every block.
+    let cipher = match &opts.password {
+        None => {
+            out.write_all(&format::header_bytes(0)).map_err(io)?;
+            None
+        }
+        Some(pw) => {
+            let (mut c, ch) = Cipher::create(pw, opts.kdf.unwrap_or_default())?;
+            let mut head = format::header_bytes(format::FLAG_ENCRYPTED).to_vec();
+            head.extend_from_slice(&ch.to_bytes());
+            c.bind(&head);
+            out.write_all(&head).map_err(io)?;
+            Some(Arc::new(c))
+        }
+    };
+    let data_start = out.position();
 
     // Internal stop flag (errors), separate from the caller's cancel flag.
     let stop = Arc::new(AtomicBool::new(false));
@@ -302,11 +342,19 @@ fn create_inner(
             let tx = res_tx.clone();
             let method = params.method.clone();
             let effort = recomp::Effort { max_expand: params.max_expand, max_plain: params.max_plain };
+            let cipher = cipher.clone();
             thread::spawn(move || loop {
                 lower_priority();
                 let job = rx.lock().unwrap().recv();
                 let Ok(job) = job else { break };
-                if tx.send(encode_block(&method, window_log, effort, job)).is_err() {
+                let enc = encode_block(&method, window_log, effort, job).and_then(|mut enc| {
+                    if let Some(c) = &cipher {
+                        c.seal_block(enc.no, &mut enc.packed)?;
+                        enc.hash = *blake3::hash(&enc.packed).as_bytes();
+                    }
+                    Ok(enc)
+                });
+                if tx.send(enc).is_err() {
                     break;
                 }
             })
@@ -316,7 +364,7 @@ fn create_inner(
 
     let mut pending = BTreeMap::new();
     let mut next = 0u64;
-    let mut offset = HEADER_LEN;
+    let mut offset = data_start;
     let mut blocks = Vec::new();
     let mut first_err: Option<Error> = None;
     for r in res_rx.iter() {
@@ -334,7 +382,7 @@ fn create_inner(
         }
         while let Some(enc) = pending.remove(&next) {
             if let Err(e) = out.write_all(&enc.packed) {
-                first_err = Some(Error::file(tmp, e));
+                first_err = Some(Error::file(archive, e));
                 stop.store(true, Relaxed);
                 break;
             }
@@ -403,20 +451,32 @@ fn create_inner(
     }
     let index = Index { blocks, entries };
     let raw = index.encode();
-    let packed = zstd::bulk::compress(&raw, 19).map_err(|e| Error::Codec(e.to_string()))?;
+    let mut packed = zstd::bulk::compress(&raw, 19).map_err(|e| Error::Codec(e.to_string()))?;
+    if let Some(c) = &cipher {
+        c.seal_index(&mut packed)?;
+    }
     let footer = Footer {
         index_offset: offset,
         index_packed_len: packed.len() as u64,
         index_raw_len: raw.len() as u64,
         index_hash: *blake3::hash(&packed).as_bytes(),
-        flags: 0,
+        flags: if cipher.is_some() { format::FLAG_ENCRYPTED } else { 0 },
     };
-    let io = |e| Error::file(tmp, e);
     out.write_all(&packed).map_err(io)?;
     out.write_all(&footer.to_bytes()).map_err(io)?;
-    let file = out.into_inner().map_err(|e| io(e.into_error()))?;
-    file.sync_all().map_err(io)?;
-    let archive_size = file.metadata().map_err(io)?.len();
+
+    let mut recovery = None;
+    if opts.recovery_percent > 0.0 {
+        report.phase = Phase::Protecting;
+        let protected = out.position();
+        let r = crate::recovery::append(out, protected, opts.recovery_percent, cancel, &mut |done, total| {
+            report.bytes_done = done;
+            report.bytes_total = total;
+            progress(&report);
+        })?;
+        recovery = Some(r);
+    }
+    let archive_size = out.position();
 
     Ok(CreateStats {
         files: recs.len() as u64,
@@ -427,6 +487,8 @@ fn create_inner(
         threads,
         warnings,
         elapsed: Duration::ZERO,
+        outputs: Vec::new(),
+        recovery,
     })
 }
 
@@ -557,11 +619,10 @@ fn encode_recompressed(method: &Method, effort: recomp::Effort, job: &Job) -> Re
 /// Walks the inputs and returns everything to add.
 fn scan(
     inputs: &[PathBuf],
-    exclude: &[&Path],
+    excluded: &dyn Fn(&Path) -> bool,
     warnings: &mut Vec<String>,
     cancel: &AtomicBool,
 ) -> Result<Vec<Item>> {
-    let excluded: Vec<String> = exclude.iter().map(|p| path_key(p)).collect();
     let mut seen = HashSet::new();
     let mut items = Vec::new();
 
@@ -574,7 +635,7 @@ fn scan(
             warnings.push(format!("skipped {} (name is not valid Unicode)", path.display()));
             return;
         };
-        if excluded.contains(&path_key(path)) {
+        if excluded(path) {
             return;
         }
         if !seen.insert(name.to_lowercase()) {

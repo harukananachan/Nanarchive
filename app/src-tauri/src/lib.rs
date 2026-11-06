@@ -42,6 +42,43 @@ fn take_forwarded_args(state: State<Mutex<Forwarded>>) -> Vec<Vec<String>> {
 #[derive(Default)]
 struct Jobs(Mutex<HashMap<u64, Arc<AtomicBool>>>);
 
+/// Archives opened in this session. Encrypted ones keep their key here (in
+/// memory only, never saved), so the password is asked once per archive
+/// instead of for every preview or extract.
+#[derive(Default)]
+struct Opened(Mutex<HashMap<String, (Stamp, Arc<Archive>)>>);
+type Stamp = (u64, Option<SystemTime>);
+
+fn stamp(p: &Path) -> Stamp {
+    fs::metadata(p).map_or((0, None), |m| (m.len(), m.modified().ok()))
+}
+
+/// Opens (or reuses) an archive. Fails with PasswordRequired / WrongPassword
+/// for encrypted archives without the right password.
+fn get_nax(app: &AppHandle, path: &Path, password: Option<&str>) -> nax_core::Result<Arc<Archive>> {
+    let first = nax_core::volume::VolSet::open(path)?.first().to_path_buf();
+    let key = first.to_string_lossy().to_lowercase();
+    let st = stamp(&first);
+    let opened = app.state::<Opened>();
+    if let Some((s, a)) = opened.0.lock().unwrap().get(&key) {
+        if *s == st {
+            return Ok(a.clone());
+        }
+    }
+    let a = Arc::new(Archive::open_with(path, password.filter(|p| !p.is_empty()))?);
+    opened.0.lock().unwrap().insert(key, (st, a.clone()));
+    Ok(a)
+}
+
+/// Core errors as text for the UI; password problems get fixed codes.
+fn core_err(e: nax_core::Error) -> String {
+    match e {
+        nax_core::Error::PasswordRequired => "password_required".into(),
+        nax_core::Error::WrongPassword => "wrong_password".into(),
+        e => e.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Info and startup
 
@@ -94,6 +131,12 @@ enum Kind {
 }
 
 fn archive_kind(path: &Path) -> Option<Kind> {
+    // Later parts of a split archive don't start with the magic.
+    if let Some((_, _, n, ext)) = nax_core::volume::split_name(path) {
+        if n > 1 && ext.eq_ignore_ascii_case(nax_core::EXTENSION) {
+            return Some(Kind::Nax);
+        }
+    }
     let mut buf = [0u8; 4];
     fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)).ok()?;
     if nax_core::is_nax(&buf) {
@@ -265,6 +308,12 @@ struct ArchiveView {
     methods: Vec<&'static str>,
     /// "nax" or "zip".
     format: &'static str,
+    encrypted: bool,
+    /// Recovery record size in percent (0 = none) and how much it can repair.
+    recovery_percent: f64,
+    recovery_bytes: u64,
+    /// Number of parts (1 = not split).
+    parts: usize,
     paths: Vec<String>,
     sizes: Vec<u64>,
     is_dir: Vec<bool>,
@@ -273,8 +322,9 @@ struct ArchiveView {
 }
 
 #[tauri::command]
-async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
+async fn open_archive(app: AppHandle, path: String, password: Option<String>) -> CmdResult<ArchiveView> {
     let p = PathBuf::from(&path);
+    let app2 = app.clone();
     let view = tauri::async_runtime::spawn_blocking(move || -> CmdResult<ArchiveView> {
         if archive_kind(&p) == Some(Kind::Zip) {
             let z = zipread::list(&p)?;
@@ -289,6 +339,10 @@ async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
                 blocks: 0,
                 methods: vec!["zip"],
                 format: "zip",
+                encrypted: false,
+                recovery_percent: 0.0,
+                recovery_bytes: 0,
+                parts: 1,
                 paths: Vec::with_capacity(n),
                 sizes: Vec::with_capacity(n),
                 is_dir: Vec::with_capacity(n),
@@ -302,12 +356,14 @@ async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
             }
             return Ok(v);
         }
-        let a = Archive::open(&p).map_err(err)?;
+        let a = get_nax(&app2, &p, password.as_deref()).map_err(core_err)?;
         let entries = a.entries();
         let n = entries.len();
+        let shown = a.path().to_path_buf();
+        let rec = a.recovery();
         let mut v = ArchiveView {
-            path: p.to_string_lossy().into_owned(),
-            name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            path: shown.to_string_lossy().into_owned(),
+            name: shown.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             archive_size: a.archive_size(),
             total_size: a.total_size(),
             files: entries.iter().filter(|e| !e.is_dir()).count() as u64,
@@ -315,6 +371,10 @@ async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
             blocks: a.blocks().len() as u64,
             methods: a.methods(),
             format: "nax",
+            encrypted: a.is_encrypted(),
+            recovery_percent: rec.map_or(0.0, |r| r.percent()),
+            recovery_bytes: rec.map_or(0, |r| r.capacity_bytes()),
+            parts: a.parts(),
             paths: Vec::with_capacity(n),
             sizes: Vec::with_capacity(n),
             is_dir: Vec::with_capacity(n),
@@ -428,6 +488,10 @@ struct DoneEvent {
     skipped: u64,
     warnings: Vec<String>,
     elapsed_ms: u64,
+    /// Number of files written (parts of a split archive).
+    parts: u64,
+    /// Repair result: "intact", "repaired", "too_damaged" or "no_record".
+    note: Option<String>,
 }
 
 fn phase_name(p: Phase) -> &'static str {
@@ -437,6 +501,8 @@ fn phase_name(p: Phase) -> &'static str {
         Phase::Finishing => "finishing",
         Phase::Extracting => "extracting",
         Phase::Testing => "testing",
+        Phase::Protecting => "protecting",
+        Phase::Repairing => "repairing",
     }
 }
 
@@ -488,7 +554,7 @@ fn start_job(
             Err(e) => DoneEvent {
                 job,
                 cancelled: matches!(e, nax_core::Error::Cancelled),
-                error: Some(e.to_string()),
+                error: Some(core_err(e)),
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             },
@@ -522,8 +588,12 @@ fn create_archive(
     inputs: Vec<String>,
     preset: String,
     overwrite: bool,
+    password: Option<String>,
+    recovery: f64,
+    volume: Option<u64>,
 ) -> CmdResult<()> {
     let preset = preset_from(&preset)?;
+    let password = password.filter(|p| !p.is_empty());
     let mut dest = PathBuf::from(dest);
     if dest.extension().is_none() {
         dest.set_extension(nax_core::EXTENSION);
@@ -531,12 +601,21 @@ fn create_archive(
     let inputs: Vec<PathBuf> = inputs.into_iter().map(PathBuf::from).collect();
     let handle = app.clone();
     start_job(app, &jobs, job, move |progress, cancel| {
-        let opts = CreateOptions { preset, overwrite, cancel: Some(cancel), ..Default::default() };
+        let opts = CreateOptions {
+            preset,
+            overwrite,
+            cancel: Some(cancel),
+            password,
+            recovery_percent: recovery.clamp(0.0, 50.0),
+            volume_size: volume,
+            ..Default::default()
+        };
         let s = nax_core::create(&dest, &inputs, &opts, progress)?;
-        let out = dest.to_string_lossy().into_owned();
+        let out = s.outputs.first().unwrap_or(&dest).to_string_lossy().into_owned();
         remember(&handle, &out, s.archive_size);
         Ok(DoneEvent {
             output: out,
+            parts: s.outputs.len() as u64,
             files: s.files,
             bytes_in: s.bytes_in,
             bytes_out: s.archive_size,
@@ -557,6 +636,7 @@ fn extract_archive(
     only: Vec<String>,
     overwrite: bool,
 ) -> CmdResult<()> {
+    let handle = app.clone();
     start_job(app, &jobs, job, move |progress, cancel| {
         let path = PathBuf::from(&archive);
         if archive_kind(&path) == Some(Kind::Zip) {
@@ -564,7 +644,7 @@ fn extract_archive(
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             return Ok(DoneEvent { output: dest, files: s.files, bytes_in: size, bytes_out: s.bytes, skipped: s.skipped, ..Default::default() });
         }
-        let a = Archive::open(&archive)?;
+        let a = get_nax(&handle, &path, None)?;
         let opts = ExtractOptions {
             overwrite: if overwrite { Overwrite::Replace } else { Overwrite::Skip },
             only,
@@ -586,6 +666,7 @@ fn extract_archive(
 
 #[tauri::command]
 fn test_archive(app: AppHandle, jobs: State<Jobs>, job: u64, archive: String) -> CmdResult<()> {
+    let handle = app.clone();
     start_job(app, &jobs, job, move |progress, cancel| {
         let path = PathBuf::from(&archive);
         if archive_kind(&path) == Some(Kind::Zip) {
@@ -593,13 +674,38 @@ fn test_archive(app: AppHandle, jobs: State<Jobs>, job: u64, archive: String) ->
             let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             return Ok(DoneEvent { output: archive, files: s.files, bytes_in: size, bytes_out: s.bytes, ..Default::default() });
         }
-        let a = Archive::open(&archive)?;
+        let a = get_nax(&handle, &path, None)?;
         let s = a.test(None, Some(&cancel), progress)?;
         Ok(DoneEvent {
             output: archive,
             files: s.files,
             bytes_in: a.archive_size(),
             bytes_out: s.bytes,
+            ..Default::default()
+        })
+    });
+    Ok(())
+}
+
+/// Checks an archive against its recovery record and, if damaged, writes a
+/// repaired copy next to it (the original is left alone).
+#[tauri::command]
+fn repair_archive(app: AppHandle, jobs: State<Jobs>, job: u64, archive: String) -> CmdResult<()> {
+    start_job(app, &jobs, job, move |progress, cancel| {
+        let r = nax_core::recovery::repair(Path::new(&archive), Some(&cancel), progress)?;
+        let note = match (&r.info, r.damaged_shards, r.repairable) {
+            (None, _, _) => "no_record",
+            (Some(_), 0, _) => "intact",
+            (Some(_), _, true) => "repaired",
+            (Some(_), _, false) => "too_damaged",
+        };
+        Ok(DoneEvent {
+            output: r.output.first().map_or(archive.clone(), |p| p.to_string_lossy().into_owned()),
+            files: r.damaged_shards,
+            bytes_in: r.info.map_or(0, |i| i.capacity_bytes()),
+            bytes_out: r.damaged_bytes,
+            parts: r.output.len() as u64,
+            note: Some(note.into()),
             ..Default::default()
         })
     });
@@ -645,7 +751,7 @@ fn image_mime(ext: &str) -> Option<&'static str> {
 }
 
 #[tauri::command]
-async fn preview(archive: String, entry: String) -> CmdResult<PreviewView> {
+async fn preview(app: AppHandle, archive: String, entry: String) -> CmdResult<PreviewView> {
     tauri::async_runtime::spawn_blocking(move || -> CmdResult<PreviewView> {
         let ext = Path::new(&entry).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
         let mime = image_mime(&ext);
@@ -660,7 +766,7 @@ async fn preview(archive: String, entry: String) -> CmdResult<PreviewView> {
             let n = bytes.len() as u64;
             (bytes, n)
         } else {
-            let a = Archive::open(&archive).map_err(err)?;
+            let a = get_nax(&app, &path, None).map_err(core_err)?;
             let e = a.entries().iter().find(|e| e.path == entry).ok_or("file not found in archive")?;
             let size = e.size;
             if e.is_dir() || size > PREVIEW_MAX {
@@ -738,7 +844,7 @@ fn window_mode(w: &tauri::WebviewWindow, quick: bool, add: bool) {
     use tauri::LogicalSize;
     if quick {
         let _ = w.set_min_size(Some(LogicalSize::new(420.0, 360.0)));
-        let _ = w.set_size(if add { LogicalSize::new(640.0, 620.0) } else { LogicalSize::new(480.0, 470.0) });
+        let _ = w.set_size(if add { LogicalSize::new(660.0, 760.0) } else { LogicalSize::new(480.0, 470.0) });
     } else {
         let _ = w.set_min_size(Some(LogicalSize::new(760.0, 520.0)));
         let _ = w.set_size(LogicalSize::new(1100.0, 720.0));
@@ -787,6 +893,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Jobs::default())
+        .manage(Opened::default())
         .manage(Mutex::new(Forwarded::default()))
         .invoke_handler(tauri::generate_handler![
             core_info,
@@ -803,6 +910,7 @@ pub fn run() {
             create_archive,
             extract_archive,
             test_archive,
+            repair_archive,
             cancel_job,
             preview,
             shell_status,

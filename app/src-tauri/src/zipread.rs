@@ -140,11 +140,20 @@ pub fn run(
         } else if f.is_dir() {
             continue;
         }
+        let declared = f.size();
+        let mut entry_bytes = 0u64;
         // Reading to the end makes the zip crate check the CRC.
         loop {
             let n = f.read(&mut buf).map_err(|e| format!("{}: {e}", f.name()))?;
             if n == 0 {
                 break;
+            }
+            // A ZIP entry may lie about its size (zip bomb): never write more than declared.
+            entry_bytes += n as u64;
+            if entry_bytes > declared {
+                drop(out);
+                let _ = fs::remove_file(&target);
+                return Err(format!("{}: bigger than the ZIP says (damaged or a zip bomb)", f.name()));
             }
             if let Some(w) = out.as_mut() {
                 w.write_all(&buf[..n]).map_err(|e| format!("{}: {e}", target.display()))?;

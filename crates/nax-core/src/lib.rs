@@ -1,4 +1,4 @@
-﻿//! Nanarchive core: the `.nax` archive format and compression engine.
+//! Nanarchive core: the `.nax` archive format and compression engine.
 //!
 //! - [`create`] builds an archive from files and folders.
 //! - [`Archive`] opens one to list, extract or test it.
@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod archive;
 mod codec;
 mod create;
+pub mod crypto;
 mod estimate;
 pub mod format;
 pub mod fsmeta;
@@ -18,7 +19,9 @@ mod ldm;
 pub mod paths;
 mod preset;
 mod recomp;
+pub mod recovery;
 mod varint;
+pub mod volume;
 mod zipped;
 
 pub use archive::{Archive, ExtractOptions, ExtractStats, Overwrite, TestStats};
@@ -26,6 +29,7 @@ pub use create::{create, CreateOptions, CreateStats};
 pub use estimate::{estimate, Estimate};
 pub use format::{BlockInfo, Entry, EntryKind};
 pub use preset::Preset;
+pub use recovery::{RecoveryInfo, RepairReport};
 
 /// File extension for Nanarchive archives.
 pub const EXTENSION: &str = "nax";
@@ -47,6 +51,10 @@ pub enum Phase {
     Finishing,
     Extracting,
     Testing,
+    /// Adding the recovery record.
+    Protecting,
+    /// Rebuilding damaged data from the recovery record.
+    Repairing,
 }
 
 /// Progress report passed to callbacks.
@@ -90,6 +98,10 @@ pub enum Error {
     AlreadyExists(PathBuf),
     #[error("cancelled")]
     Cancelled,
+    #[error("this archive is protected with a password")]
+    PasswordRequired,
+    #[error("wrong password")]
+    WrongPassword,
 }
 
 impl Error {
