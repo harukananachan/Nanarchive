@@ -87,6 +87,24 @@ bytes   all encoded segments, in order
 Kinds: 1 = JPEG (Lepton), 2 = PNG, 3 = ZIP, 4 = GZip. Kinds 2–4 use the "unpacked deflate"
 layout from `crates/nax-core/src/zipped.rs`: a piece list (raw / deflate / PNG IDAT group), then
 raw bytes, decompressed data and preflate corrections. IDAT CRCs are recomputed when rebuilding.
+
+Kind 5 = MPEG-1 video (program stream `.mpg` or bare `.m1v`), defined by
+`crates/nax-core/src/mpeg.rs` (version 1). The video stream is taken out of its packets; every
+slice is parsed down to macroblock types, motion vectors, block patterns and DCT coefficients, and
+these are coded with a context-mixing binary arithmetic coder (contexts from the neighbouring and
+previous-picture blocks). Slices that do not re-encode to the exact same bits stay raw; MPEG-2
+video is not touched. Layout:
+
+```
+u8      version (1)
+varint  side raw length, varint side packed length, bytes side (LZMA)
+varint  chunk_count, chunk_count x varint chunk length, then the coded chunks
+```
+
+The side data holds the packet skeleton (all bytes except video payload), where video payload goes
+back in, and per chunk the list of units (raw bytes, or a slice start code with its zero padding).
+Chunks are at least 2 MB, start at a sequence header and are coded independently (in parallel).
+The encoder decodes its own output and keeps it only if the bytes match.
 A big LZMA2 payload may be several independently compressed pieces joined into one stream (each
 starts with a dictionary reset), which is plain LZMA2 to the decoder.
 

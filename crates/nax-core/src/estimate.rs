@@ -33,8 +33,12 @@ fn speeds(g: Group) -> [f64; 5] {
         // Unpacking and re-checking deflate streams (PNG, ZIP, DOCX...).
         Group::Deflated => [600.0, 200.0, 12.0, 3.5, 1.5],
         Group::Media => [600.0, 300.0, 150.0, 150.0, 150.0],
+        // MPEG-1 video re-coding (several threads per file).
+        Group::Mpeg => [600.0, 300.0, 5.0, 5.0, 5.0],
     }
 }
+
+const ALL_GROUPS: [Group; 5] = [Group::General, Group::Jpeg, Group::Deflated, Group::Media, Group::Mpeg];
 
 const SAMPLE_FILES: usize = 96;
 const SAMPLE_PER_FILE: u64 = 192 << 10;
@@ -46,6 +50,7 @@ enum Group {
     Jpeg,
     Deflated,
     Media,
+    Mpeg,
 }
 
 /// Size multiplier per preset (Store, Fast, Balanced, Max, Ultra).
@@ -54,6 +59,7 @@ fn factors(g: Group) -> [f64; 5] {
         Group::Jpeg => [1.0, 0.99, 0.78, 0.77, 0.77],
         Group::Deflated => [1.0, 0.97, 0.80, 0.74, 0.70],
         Group::Media => [1.0, 1.0, 1.0, 1.0, 1.0],
+        Group::Mpeg => [1.0, 0.99, 0.81, 0.81, 0.81],
         // Relative to the sampled fast-zstd size (the Store entry is unused).
         Group::General => [1.0, 1.0, 0.64, 0.61, 0.51],
     }
@@ -71,15 +77,29 @@ fn group(path: &Path) -> Group {
         | "apk" | "epub" | "nupkg" | "whl" | "vsix" => Group::Deflated,
         "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" | "mp3" | "m4a" | "aac" | "ogg" | "opus"
         | "flac" | "webp" | "heic" | "avif" | "7z" | "rar" | "xz" | "zst" | "bz2" | "lz4" | "nax"
-        | "cab" | "msi" => Group::Media,
+        | "cab" | "msi" | "vob" | "m2v" | "m2ts" | "mts" | "ts" => Group::Media,
+        "mpg" | "mpeg" | "m1v" | "mpv" | "dat" => {
+            if is_mpeg1(path) {
+                Group::Mpeg
+            } else {
+                Group::Media
+            }
+        }
         _ => Group::General,
     }
+}
+
+/// MPEG-1 video Nanarchive can re-code (MPEG-2 has a different pack header).
+fn is_mpeg1(path: &Path) -> bool {
+    let mut head = [0u8; 5];
+    let ok = fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok();
+    ok && head[..3] == [0, 0, 1] && ((head[3] == 0xBA && head[4] >> 4 == 2) || head[3] == 0xB3)
 }
 
 /// Estimates archive sizes for all presets.
 pub fn estimate(inputs: &[PathBuf]) -> Estimate {
     let mut est = Estimate::default();
-    let mut per_group = [0u64; 4];
+    let mut per_group = [0u64; 5];
     let mut general: Vec<(PathBuf, u64)> = Vec::new();
     let mut stack: Vec<PathBuf> = inputs.to_vec();
     let mut seen = 0u64;
@@ -110,10 +130,15 @@ pub fn estimate(inputs: &[PathBuf]) -> Estimate {
     let ratio = sample_ratio(&mut general);
     for (i, size) in est.sizes.iter_mut().enumerate() {
         let mut total = 0f64;
-        for g in [Group::General, Group::Jpeg, Group::Deflated, Group::Media] {
+        for g in ALL_GROUPS {
             let bytes = per_group[g as usize] as f64;
-            let f = factors(g)[i];
-            total += if g == Group::General && i > 0 { bytes * ratio * f } else { bytes * f };
+            let mut f = factors(g)[i];
+            if g == Group::General && i > 0 {
+                // The factors were measured on data that compresses well; for
+                // data that barely does (sampled ratio near 1) they fade out.
+                f = f.powf(((1.0 - ratio) / 0.5).clamp(0.0, 1.0)) * ratio;
+            }
+            total += bytes * f;
         }
         // Index and header: roughly 24 bytes per entry plus a fixed part.
         let overhead = 96 + (est.files + est.dirs) * 24;
@@ -125,7 +150,7 @@ pub fn estimate(inputs: &[PathBuf]) -> Estimate {
     let scale = (threads / 28.0).clamp(0.08, 1.5);
     for (i, secs) in est.seconds.iter_mut().enumerate() {
         let mut t = 0.3;
-        for g in [Group::General, Group::Jpeg, Group::Deflated, Group::Media] {
+        for g in ALL_GROUPS {
             t += per_group[g as usize] as f64 / 1_048_576.0 / (speeds(g)[i] * scale);
         }
         *secs = t;
@@ -194,5 +219,26 @@ mod tests {
         assert!(est.sizes[0] >= est.bytes, "store keeps everything");
         assert!(est.sizes[1] < est.bytes / 3, "text compresses well");
         assert!(est.sizes[2] <= est.sizes[1] && est.sizes[4] <= est.sizes[3]);
+    }
+
+    #[test]
+    fn incompressible_data_is_not_promised_a_big_gain() {
+        let dir = std::env::temp_dir().join(format!("nax-est-noise-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let noise: Vec<u8> = (0..3_000_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        fs::write(dir.join("clip.bin"), &noise).unwrap();
+        let est = estimate(&[dir.clone()]);
+        fs::remove_dir_all(&dir).unwrap();
+        for s in est.sizes {
+            assert!(s as f64 >= noise.len() as f64 * 0.97, "{s}");
+        }
     }
 }

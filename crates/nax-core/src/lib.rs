@@ -18,6 +18,7 @@ pub mod format;
 pub mod fsmeta;
 mod history;
 mod ldm;
+pub mod mpeg;
 pub mod paths;
 mod preset;
 mod recomp;

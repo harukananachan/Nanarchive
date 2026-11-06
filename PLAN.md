@@ -192,6 +192,22 @@ Trade-off: extracting Ultra is as slow as creating it (~0.3 MB/s per thread; abo
   (https only, empty = off), so no GitHub or other fixed host is needed. The build script writes
   `latest.json` to upload next to the installer.
 - The app starts on the drive list ("This PC").
+
+**Phase 8 — video** (in progress)
+- MPEG-1 video (`.mpg`, `.m1v`, Video CD `.dat`) is recompressed losslessly (`crates/nax-core/src/mpeg.rs`):
+  slices are parsed to DCT coefficients and motion vectors and coded with context mixing; the
+  file comes back bit for bit. Works in every preset from Normal up. Lab:
+  `cargo run --release -p nax-core --example mpeg_lab -- file.mpg`.
+- Fixed the size/time estimate for video: it promised 10 MB / 7 s for a 22.9 MB `.mpg` that
+  really took 27 s; now nearly incompressible data is not promised a big gain.
+
+| 22.87 MB MPEG-1 clip | Size | Time |
+|---|---:|---:|
+| **Nanarchive** | **18.46 MB** | 4.6 s |
+| 7z Ultra | 21.99 MB | |
+| WinRAR Best | 22.20 MB | |
+
+Next: MPEG-2 (DVD `.vob`, `.m2v`). H.264/H.265 (`.mp4`, `.mkv`) is not shrunk yet.
 ## 7. How we'll know it's "the best"
 
 - Benchmark table in the README: size and speed vs ZIP, 7z (Ultra), RAR5 (Best) on the same corpus.

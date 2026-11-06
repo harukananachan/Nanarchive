@@ -56,6 +56,11 @@ impl<'a> Dec<'a> {
         self.pos >= self.buf.len()
     }
 
+    /// Bytes read so far.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
     pub fn u8(&mut self) -> Result<u8> {
         let b = *self.buf.get(self.pos).ok_or_else(|| bad("length"))?;
         self.pos += 1;

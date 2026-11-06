@@ -155,6 +155,24 @@ mod lzma {
     }
 }
 
+/// Plain LZMA2 for side data of specialist codecs (e.g. video headers).
+pub(crate) fn lzma_pack(data: &[u8]) -> Result<Vec<u8>> {
+    let dict = (1u32 << ceil_log2(data.len()).clamp(16, 26)).max(4096);
+    let mut opts = lzma::options(9 | LZMA_EXTREME, dict, &[])?;
+    lzma::run(true, false, &mut opts, data, data.len() / 2 + 64, None)
+}
+
+/// Undoes [`lzma_pack`]; the result must be exactly `size` bytes.
+pub(crate) fn lzma_unpack(packed: &[u8], size: usize) -> Result<Vec<u8>> {
+    let dict = (1u32 << ceil_log2(size).clamp(16, 26)).max(4096);
+    let mut opts = lzma::options(6, dict, &[])?;
+    let out = lzma::run(false, false, &mut opts, packed, size + 1, Some(size))?;
+    if out.len() != size {
+        return Err(Error::Corrupt("side data has the wrong size".into()));
+    }
+    Ok(out)
+}
+
 /// Compresses `data` with the block codec. `prefix` is the original data just
 /// before this block (only used by LZMA2). `None` = not worth it, store raw.
 ///

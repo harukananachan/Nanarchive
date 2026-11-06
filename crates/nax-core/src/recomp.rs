@@ -1,4 +1,4 @@
-﻿//! Recompression of already-compressed files (step 4).
+//! Recompression of already-compressed files (step 4).
 //!
 //! Some files are compressed with old, weak methods (JPEG's Huffman coding,
 //! deflate in PNG/ZIP). A plain compressor can't do anything with them, but
@@ -38,15 +38,26 @@ pub(crate) enum Kind {
     Zip = 3,
     /// GZip file.
     Gzip = 4,
+    /// MPEG-1 video (program or video stream), see mpeg.rs.
+    Mpeg = 5,
 }
 
 impl Kind {
+    /// Largest file of this kind recompressed as one piece.
+    pub fn max_size(self) -> usize {
+        match self {
+            Kind::Mpeg => 256 << 20,
+            _ => 64 << 20,
+        }
+    }
+
     fn from_u8(v: u8) -> Option<Kind> {
         match v {
             1 => Some(Kind::Jpeg),
             2 => Some(Kind::Png),
             3 => Some(Kind::Zip),
             4 => Some(Kind::Gzip),
+            5 => Some(Kind::Mpeg),
             _ => None,
         }
     }
@@ -55,6 +66,9 @@ impl Kind {
     pub fn sniff(head: &[u8]) -> Option<Kind> {
         if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
             return Some(Kind::Jpeg);
+        }
+        if crate::mpeg::sniff(head) {
+            return Some(Kind::Mpeg);
         }
         Some(match Container::sniff(head)? {
             Container::Png => Kind::Png,
@@ -65,7 +79,7 @@ impl Kind {
 
     fn container(self) -> Option<Container> {
         match self {
-            Kind::Jpeg => None,
+            Kind::Jpeg | Kind::Mpeg => None,
             Kind::Png => Some(Container::Png),
             Kind::Zip => Some(Container::Zip),
             Kind::Gzip => Some(Container::Gzip),
@@ -117,6 +131,8 @@ fn encode_one(kind: Kind, data: &[u8], effort: Effort) -> Option<Vec<u8>> {
             };
             r.ok().map(|(v, _)| v)
         }),
+        // Checks itself by decoding again.
+        Kind::Mpeg => guarded(|| crate::mpeg::encode(data)),
         _ => None,
     }
 }
@@ -133,6 +149,7 @@ fn decode_one(kind: Kind, enc: &[u8], len: usize) -> Result<Vec<u8>> {
                 .ok()
                 .map(|_| out)
         }),
+        Kind::Mpeg => guarded(|| crate::mpeg::decode(enc, len).ok()),
         _ => None,
     };
     match out {

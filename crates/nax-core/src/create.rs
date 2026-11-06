@@ -760,10 +760,6 @@ struct Packer {
     tx: SyncSender<Raw>,
 }
 
-/// Largest file that is recompressed as one piece (a bigger one is stored
-/// the normal way).
-const MAX_SEGMENT: usize = 64 << 20;
-
 impl Packer {
     fn send(&mut self) -> Result<()> {
         self.blocks += 1;
@@ -778,7 +774,7 @@ impl Packer {
     fn push_file(&mut self, data: &[u8]) -> Result<()> {
         let kind = Kind::sniff(data).filter(|&k| k != Kind::Zip || crate::zipped::zip_worth_trying(data));
         match kind {
-            Some(kind) if data.len() <= MAX_SEGMENT => {
+            Some(kind) if data.len() <= kind.max_size() => {
                 if !self.buf.is_empty() && self.buf.len() + data.len() > self.block_size {
                     self.send()?;
                 }
@@ -839,8 +835,8 @@ fn read_if_recompressible(f: &mut File) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::{Seek, SeekFrom};
     let mut head = [0u8; 16];
     let n = f.read(&mut head)?;
-    let small_enough = f.metadata()?.len() <= MAX_SEGMENT as u64;
-    if small_enough && Kind::sniff(&head[..n]).is_some() {
+    let len = f.metadata()?.len();
+    if Kind::sniff(&head[..n]).is_some_and(|k| len <= k.max_size() as u64) {
         let mut data = head[..n].to_vec();
         f.read_to_end(&mut data)?;
         return Ok(Some(data));
