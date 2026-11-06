@@ -120,7 +120,7 @@ const en = {
   "pd.fast": "Very quick, about ZIP size. Good for quick backups.",
   "pd.balanced": "Smaller than WinRAR, about as fast. The best everyday choice.",
   "pd.max": "Smaller than 7-Zip Ultra on most files, and several times faster.",
-  "pd.ultra": "The smallest archive. Slow — for files you keep a long time.",
+  "pd.ultra": "The smallest archive — beats 7-Zip and WinRAR on every kind of file. Packing and unpacking are both slow.",
 
   // Extract dialog
   "ex.title": "Extract",
@@ -140,6 +140,8 @@ const en = {
   "info.original": "Original size",
   "info.archive": "Archive size",
   "info.methods": "Methods",
+  "meth.cm": "context mixing",
+  "meth.recompress": "recompression",
   "info.blocks": "Blocks",
   "info.format": "Format",
   "info.bytes": "{n} bytes",
@@ -376,7 +378,7 @@ const ru: Record<Key, string> = {
   "pd.fast": "Очень быстро, примерно как ZIP. Для быстрых резервных копий.",
   "pd.balanced": "Меньше, чем WinRAR, и примерно так же быстро. Лучший выбор на каждый день.",
   "pd.max": "Меньше, чем 7-Zip Ultra, на большинстве файлов — и в несколько раз быстрее.",
-  "pd.ultra": "Самый маленький архив. Медленно — для файлов на долгое хранение.",
+  "pd.ultra": "Самый маленький архив — меньше 7-Zip и WinRAR на любых файлах. Сжатие и распаковка медленные.",
 
   "ex.title": "Извлечение",
   "ex.some": "Выбрано объектов: {n}",
@@ -394,6 +396,8 @@ const ru: Record<Key, string> = {
   "info.original": "Исходный размер",
   "info.archive": "Размер архива",
   "info.methods": "Методы",
+  "meth.cm": "контекстное смешивание",
+  "meth.recompress": "пересжатие",
   "info.blocks": "Блоков",
   "info.format": "Формат",
   "info.bytes": "{n} байт",
@@ -520,6 +524,11 @@ export function lang(): Lang {
 
 export function locale(): string {
   return lang() === "ru" ? "ru-RU" : "en-US";
+}
+
+/** Compression method names as shown to people ("cm" -> "context mixing"). */
+export function methodNames(methods: string[]): string {
+  return methods.map((m) => (m === "cm" || m === "recompress" ? t(`meth.${m}` as Key) : m)).join(", ");
 }
 
 export function t(key: Key, params?: Record<string, string | number>): string {

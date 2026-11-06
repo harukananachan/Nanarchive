@@ -28,6 +28,7 @@ cd app && npm install && npm run tauri dev   # run the desktop app
 
 ```bash
 nax a photos.nax C:\Photos -p max       # create (presets: store, fast, balanced, max, ultra)
+nax a keep.nax C:\Docs -p ultra         # smallest; extracting is as slow as packing
 nax l photos.nax                        # list contents (instant)
 nax t photos.nax                        # test: check every checksum
 nax x photos.nax -o D:\Restore          # extract (existing files are kept; -y replaces)
@@ -48,4 +49,5 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 - Phase 3 (JPEG/PNG/ZIP recompression, dedup, file-type sorting, Max tuning) — done
 - Phase 4 (desktop app: WinRAR-style file manager, English + Russian, Explorer right-click menu and .nax icon, opens ZIP) — done
 - Phase 5 (AES-256 password encryption, recovery records + repair, split volumes, fuzzed and hardened reader) — done
-- Next: Phase 6 — Ultra mode
+- Phase 6 (Ultra = own context-mixing codec: smaller than 7-Zip Ultra and WinRAR Best in every benchmark category; extracting Ultra is slow) — done
+- Next: Phase 7 — 7z/RAR opening, installer, auto-update

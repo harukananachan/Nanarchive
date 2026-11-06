@@ -34,7 +34,7 @@
   import { baseName, bytes, count, dirName, ext, fileKind } from "$lib/fmt";
   import { buildTree, type Node } from "$lib/tree";
   import { ACCENTS, newJob, saveSettings, settings, toast } from "$lib/state.svelte";
-  import { lang, t } from "$lib/i18n.svelte";
+  import { lang, methodNames, t } from "$lib/i18n.svelte";
   import { syncExplorer } from "$lib/explorer";
 
   // --- Where we are -----------------------------------------------------------
@@ -747,7 +747,7 @@
         {#if a.encrypted}<span class="pill lock" title={t("info.encAes")}><Icon name="lock" size={12} /> AES-256</span>{/if}
         {#if a.recovery_percent > 0}<span class="pill shield" title={t("info.recovery")}><Icon name="shield" size={12} /> {Math.round(a.recovery_percent)}%</span>{/if}
         <span class="pill">{t("smaller", { p: a.total_size ? Math.round((1 - a.archive_size / a.total_size) * 100) : 0 })}</span>
-        {t("status.files", { n: count(a.files) })} · {a.methods.join(", ")}
+        {t("status.files", { n: count(a.files) })} · {methodNames(a.methods)}
       </span>
     {/if}
   </footer>

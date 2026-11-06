@@ -58,6 +58,7 @@ sizes before it, and the total must end exactly at `index_offset`.
 
 Each block has a chain of steps applied in order when compressing (reversed when extracting).
 Allowed shapes: `[]` (stored raw), `[codec]`, `[LDM]`, `[LDM, codec]`, `[RECOMP]`, `[RECOMP, codec]`.
+A codec is zstd, LZMA2 or CM.
 
 | Step id | Name | Props |
 |---|---|---|
@@ -65,6 +66,7 @@ Allowed shapes: `[]` (stored raw), `[codec]`, `[LDM]`, `[LDM, codec]`, `[RECOMP]
 | 2 | LZMA2 (raw) | 4 bytes: dictionary size (u32); optionally + 4 bytes: preset-dictionary length (u32); optionally + 1 byte flags (bit 0: x86 BCJ filter in front of LZMA2) |
 | 3 | LDM (long-range matches) | u8 window log, varint payload length |
 | 4 | RECOMP (recompressed files) | varint payload length |
+| 5 | CM (context mixing, Ultra) | 3 bytes: version (`1`), flags (bit 0: x86 call transform), hash table size (log2 of buckets, 16–24) |
 
 **Preset dictionary.** If the LZMA2 props carry a length `P > 0`, the coder is primed with the `P`
 original stream bytes just before the block. Such blocks are decoded in stream order.
@@ -89,6 +91,19 @@ A big LZMA2 payload may be several independently compressed pieces joined into o
 starts with a dictionary reset), which is plain LZMA2 to the decoder.
 
 **Duplicates.** Identical files are stored once; their entries share the same stream range.
+
+**CM (step 5).** Bitwise context mixing, defined by the code in `crates/nax-core/src/cm.rs`
+(version 1); the decoder must run the identical model, so the code is the specification. In short:
+each bit is predicted from 14 hashed contexts (orders 2, 3, 5, 8, two "indirect" contexts, word,
+word pair, column, four sparse byte pairs, the byte a match predicts), stored as bit histories in
+32-byte buckets and mapped to probabilities by learned tables, plus order 0/1 counters and a match
+model (last occurrence of the previous 7 bytes). Two neural mixers (weights chosen by order 0 +
+match state, and by the previous byte) and a final mixer combine them; three APM/SSE stages refine
+the result; a 32-bit binary arithmetic coder (12-bit probabilities, carry-less, 4-byte flush) codes
+it. Integer math only. With the x86 flag, the block was first transformed: at every `E8`/`E9` byte
+the following 32-bit operand, if in `[-2^24, 2^24)`, gets the position after it added (mod 2^25,
+staying in that range), and the scan always skips those 4 bytes. Blocks are independent; readers
+refuse CM blocks over 64 MiB. Decoding is as slow as encoding (well under 1 MB/s per thread).
 
 **LDM payload** (the input of the codec step, or the block itself for `[LDM]`):
 

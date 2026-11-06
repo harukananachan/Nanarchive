@@ -9,7 +9,7 @@
 
 use zstd::zstd_safe::{CParameter, DParameter};
 
-use crate::format::{Step, STEP_LDM, STEP_LZMA2, STEP_RECOMP, STEP_ZSTD};
+use crate::format::{Step, STEP_CM, STEP_LDM, STEP_LZMA2, STEP_RECOMP, STEP_ZSTD};
 use crate::history::History;
 use crate::varint::{Dec, Enc};
 use crate::{ldm, recomp, Error, Result};
@@ -386,7 +386,33 @@ fn decode_codec(step: Option<&Step>, packed: Vec<u8>, size: usize, prefix: &[u8]
             }
             Ok(out)
         }
+        STEP_CM => {
+            let out = crate::cm::decode(&s.props, &packed, size)?;
+            if out.len() != size {
+                return Err(bad_size());
+            }
+            Ok(out)
+        }
         _ => Err(Error::Corrupt("unknown compression method (made by a newer Nanarchive?)".into())),
+    }
+}
+
+/// Context-mixing compression (Ultra). `None` if it didn't get smaller.
+pub(crate) fn encode_cm(data: &[u8], x86: bool) -> Option<(Step, Vec<u8>)> {
+    if data.is_empty() {
+        return None;
+    }
+    let (props, out) = crate::cm::encode(data, x86);
+    (out.len() < data.len()).then(|| (Step { id: STEP_CM, props }, out))
+}
+
+/// Memory one thread needs to decode a block with this chain.
+pub(crate) fn decode_memory(chain: &[Step], size: usize) -> u64 {
+    let base = size as u64 * 3 + (64 << 20);
+    if chain.iter().any(|s| s.id == STEP_CM) {
+        base + crate::cm::memory(size)
+    } else {
+        base
     }
 }
 

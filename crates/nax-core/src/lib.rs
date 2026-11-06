@@ -10,6 +10,8 @@ use std::path::PathBuf;
 mod archive;
 mod codec;
 mod create;
+#[doc(hidden)]
+pub mod cm;
 pub mod crypto;
 mod estimate;
 pub mod format;

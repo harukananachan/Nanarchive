@@ -3,7 +3,7 @@
   import FileIcon from "./FileIcon.svelte";
   import type { ArchiveView } from "./api";
   import { bytes, count } from "./fmt";
-  import { t } from "./i18n.svelte";
+  import { methodNames, t } from "./i18n.svelte";
 
   let { archive, onclose }: { archive: ArchiveView; onclose: () => void } = $props();
   const ratio = $derived(archive.total_size > 0 ? archive.archive_size / archive.total_size : 1);
@@ -28,7 +28,7 @@
     <dt>{t("info.folders")}</dt><dd>{count(archive.dirs)}</dd>
     <dt>{t("info.original")}</dt><dd>{bytes(archive.total_size, 2)} <span class="muted">({t("info.bytes", { n: count(archive.total_size) })})</span></dd>
     <dt>{t("info.archive")}</dt><dd>{bytes(archive.archive_size, 2)} <span class="muted">({t("info.bytes", { n: count(archive.archive_size) })})</span></dd>
-    <dt>{t("info.methods")}</dt><dd>{archive.methods.join(", ")}</dd>
+    <dt>{t("info.methods")}</dt><dd>{methodNames(archive.methods)}</dd>
     {#if archive.format === "nax"}<dt>{t("info.blocks")}</dt><dd>{count(archive.blocks)}</dd>{/if}
     {#if archive.format === "nax"}
       <dt>{t("info.encryption")}</dt><dd>{archive.encrypted ? t("info.encAes") : t("info.encNone")}</dd>

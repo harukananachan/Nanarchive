@@ -103,6 +103,9 @@ fn round_trip_every_preset() {
 
         let a = Archive::open(&archive).unwrap();
         assert_eq!(a.entries().len(), stats.files as usize + stats.dirs as usize);
+        if preset == Preset::Ultra {
+            assert!(a.blocks().iter().any(|b| b.method_name() == "cm"), "ultra should use context mixing");
+        }
         assert!(a.entries().iter().any(|e| e.path == "data/docs/Привет мир.txt"));
 
         let t = a.test(Some(2), None, &mut noop).unwrap();

@@ -161,16 +161,25 @@ file type (JPEG and PNG/ZIP recompression are much slower than plain data on Max
 - CLI: `-P` password, `-r` recovery %, `-v` volume size, `nax repair`. App: protection options in
   Add, password prompt, Repair button, Info rows, status bar pills.
 
-**Phase 6 — Ultra mode: beat 7z and WinRAR on everything**
-Goal: Ultra is smaller than 7z Ultra **and** WinRAR Best on every category of the benchmark
-corpus — not only photos/docs, but also text, source code, logs, executables and mixed folders.
-- Context-mixing (CM) codec: many small prediction models (order-N context, word model,
-  structure models for exe/text/tables) mixed by a neural mixer, then arithmetic coding.
-- Specialized models per data type (x86 code, text/words, BMP/WAV raw data, tables/CSV).
-- Multi-threaded by splitting into blocks so it stays usable on many-core CPUs.
-- Tune with the benchmark until every row of the table is a win; track speed too.
-✅ Done when: the benchmark shows Ultra smaller than both 7z and WinRAR in every category.
+**Phase 6 — Ultra mode: beat 7z and WinRAR on everything** ✅ done
+Ultra now uses our own context-mixing codec (block step 5, `crates/nax-core/src/cm.rs`):
+14 hashed contexts kept as bit histories (orders 2/3/5/8, indirect, word, word pair, column,
+sparse byte pairs, match byte), order 0/1, a match model, two neural mixers + final mixer, three
+SSE stages, binary arithmetic coding; x86 call transform for executables; AVX2 mixer when
+available; 8 MB blocks coded in parallel. Lab: `cargo run --release -p nax-core --example cm_lab`.
 
+| Category | Ultra | 7z Ultra | WinRAR Best |
+|---|---:|---:|---:|
+| code-js | **14.43 MB** | 17.86 | 19.23 |
+| code-rust | **10.85 MB** | 13.85 | 17.38 |
+| docs-html | **4.86 MB** | 5.49 | 6.42 |
+| images | **36.31 MB** | 45.58 | 45.75 |
+| png | **26.62 MB** | 32.85 | 33.15 |
+| programs | **27.13 MB** | 29.04 | 34.79 |
+| zips | **25.74 MB** | 34.00 | 35.29 |
+
+Trade-off: extracting Ultra is as slow as creating it (~0.3 MB/s per thread; about 35–50 s per
+100–150 MB on 28 threads). Max stays the fast choice.
 **Phase 7 — Windows integration & release**
 Opening 7z / RAR (extract only) — ZIP and the Explorer menu are already done in Phase 4,
 installer (MSI/NSIS via Tauri), auto-update.

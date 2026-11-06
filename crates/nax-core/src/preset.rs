@@ -1,4 +1,4 @@
-﻿//! What each preset means in terms of codec, block size and memory.
+//! What each preset means in terms of codec, block size and memory.
 
 use std::fmt;
 
@@ -6,6 +6,9 @@ use crate::codec::Method;
 use crate::{Error, Result};
 
 const MIB: usize = 1 << 20;
+/// Ultra block size: smaller blocks keep more cores busy (context mixing is
+/// slow), bigger ones give the model more to learn from.
+const ULTRA_BLOCK: usize = 8 * MIB;
 
 /// Compression presets shown to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,7 +22,8 @@ pub enum Preset {
     Balanced,
     /// Like Balanced with bigger blocks and preset dictionaries.
     Max,
-    /// LZMA2 extreme with big preset dictionaries. Context mixing arrives in Phase 6.
+    /// Context mixing: smallest archives, but extracting is as slow as
+    /// compressing (well under 1 MB/s per core).
     Ultra,
 }
 
@@ -38,6 +42,9 @@ pub(crate) struct Params {
     pub max_plain: usize,
     /// Blocks may get smaller than `block_size` to keep all cores busy.
     pub shrink_blocks: bool,
+    /// Context mixing for compressible blocks (`method` is then only used
+    /// for recompressed images and archives).
+    pub cm: bool,
 }
 
 impl Preset {
@@ -74,6 +81,7 @@ impl Preset {
                 max_expand: 0,
                 max_plain: 0,
                 shrink_blocks: true,
+                cm: false,
             },
             Preset::Fast => Params {
                 method: Method::Zstd { level: 3, window_log: 23, long: false },
@@ -83,6 +91,7 @@ impl Preset {
                 max_expand: 0,
                 max_plain: 0,
                 shrink_blocks: true,
+                cm: false,
             },
             Preset::Balanced => Params {
                 method: Method::Lzma2 { preset: 9, dict_size: 8 << 20, prefix: MIB },
@@ -92,6 +101,7 @@ impl Preset {
                 max_expand: 6,
                 max_plain: 3 * MIB,
                 shrink_blocks: true,
+                cm: false,
             },
             Preset::Max => Params {
                 method: Method::Lzma2 { preset: 9 | crate::codec::LONG_MATCHES, dict_size: 24 << 20, prefix: 8 * MIB },
@@ -101,19 +111,19 @@ impl Preset {
                 max_expand: 32,
                 max_plain: 32 * MIB,
                 shrink_blocks: false,
+                cm: false,
             },
             Preset::Ultra => Params {
-                method: Method::Lzma2 {
-                    preset: 9 | crate::codec::LZMA_EXTREME,
-                    dict_size: 64 << 20,
-                    prefix: 48 * MIB,
-                },
-                block_size: 16 * MIB,
-                mem_per_thread: mb(800),
+                // LZMA2 only for recompressed images and archives.
+                method: Method::Lzma2 { preset: 9 | crate::codec::LZMA_EXTREME, dict_size: 64 << 20, prefix: 0 },
+                block_size: ULTRA_BLOCK,
+                mem_per_thread: crate::cm::memory(ULTRA_BLOCK + ULTRA_BLOCK / 2) + mb(3 * 12),
                 ldm_window_log: Some(30),
                 max_expand: 1000,
                 max_plain: 128 * MIB,
+                // Smaller blocks would cost 5-10% in size.
                 shrink_blocks: false,
+                cm: true,
             },
         }
     }

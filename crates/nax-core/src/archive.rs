@@ -428,8 +428,8 @@ impl Archive {
 
         let mut next_file = 0usize;
         let mut active: Vec<Active> = Vec::new();
-        let max_block = blocks.iter().map(|b| b.unpacked_size).max().unwrap_or(0);
-        let threads = pick_threads(threads, max_block * 3 + (64 << 20), needed.len());
+        let mem = needed.iter().map(|&b| codec::decode_memory(&blocks[b].chain, blocks[b].unpacked_size as usize)).max().unwrap_or(0);
+        let threads = pick_threads(threads, mem, needed.len());
 
         self.decode_blocks(&needed, threads, cancel, &mut |b, data| {
             let bstart = starts[b];

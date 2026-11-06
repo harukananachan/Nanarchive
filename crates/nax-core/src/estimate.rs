@@ -26,7 +26,8 @@ pub struct Estimate {
 /// measured on the benchmark corpus with 28 threads.
 fn speeds(g: Group) -> [f64; 5] {
     match g {
-        Group::General => [600.0, 250.0, 33.0, 14.0, 4.3],
+        // Ultra: context mixing (about 0.3 MB/s per thread).
+        Group::General => [600.0, 250.0, 33.0, 14.0, 3.2],
         // Lossless JPEG re-encoding is the slow part on Max / Ultra.
         Group::Jpeg => [600.0, 200.0, 19.0, 4.5, 2.3],
         // Unpacking and re-checking deflate streams (PNG, ZIP, DOCX...).
@@ -54,7 +55,7 @@ fn factors(g: Group) -> [f64; 5] {
         Group::Deflated => [1.0, 0.97, 0.80, 0.74, 0.70],
         Group::Media => [1.0, 1.0, 1.0, 1.0, 1.0],
         // Relative to the sampled fast-zstd size (the Store entry is unused).
-        Group::General => [1.0, 1.0, 0.64, 0.61, 0.58],
+        Group::General => [1.0, 1.0, 0.64, 0.61, 0.51],
     }
 }
 

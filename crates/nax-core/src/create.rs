@@ -342,12 +342,13 @@ fn create_inner(
             let tx = res_tx.clone();
             let method = params.method.clone();
             let effort = recomp::Effort { max_expand: params.max_expand, max_plain: params.max_plain };
+            let cm = params.cm;
             let cipher = cipher.clone();
             thread::spawn(move || loop {
                 lower_priority();
                 let job = rx.lock().unwrap().recv();
                 let Ok(job) = job else { break };
-                let enc = encode_block(&method, window_log, effort, job).and_then(|mut enc| {
+                let enc = encode_block(&method, cm, window_log, effort, job).and_then(|mut enc| {
                     if let Some(c) = &cipher {
                         c.seal_block(enc.no, &mut enc.packed)?;
                         enc.hash = *blake3::hash(&enc.packed).as_bytes();
@@ -517,7 +518,7 @@ fn fit_block_size(total: u64, base: usize, threads: usize, shrink: bool) -> usiz
     ideal.clamp(min, base + base / 2)
 }
 
-fn encode_block(method: &Method, window_log: Option<u8>, effort: recomp::Effort, job: Job) -> Result<Encoded> {
+fn encode_block(method: &Method, cm: bool, window_log: Option<u8>, effort: recomp::Effort, job: Job) -> Result<Encoded> {
     let orig = &job.orig;
     let unpacked = orig.len() as u64;
     if !job.segments.is_empty() && matches!(method, Method::Lzma2 { .. }) {
@@ -532,12 +533,17 @@ fn encode_block(method: &Method, window_log: Option<u8>, effort: recomp::Effort,
     // LZMA's literal coder, which fast mode has too; noise is stored.
     let mut method = method;
     let fast;
+    let mut compressible = true;
     if let Method::Lzma2 { dict_size, .. } = *method {
         match codec::sample_ratio(input) {
-            r if r >= 100 => method = &Method::Store,
+            r if r >= 100 => {
+                method = &Method::Store;
+                compressible = false;
+            }
             r if r >= 97 => {
                 fast = Method::Lzma2 { preset: 1, dict_size: dict_size.min(1 << 20), prefix: 0 };
                 method = &fast;
+                compressible = false;
             }
             _ => {}
         }
@@ -545,7 +551,10 @@ fn encode_block(method: &Method, window_log: Option<u8>, effort: recomp::Effort,
     let prefix = if method.prefix() > 0 { &job.prefix[..] } else { &[] };
     // A big file kept whole (an archive that couldn't be unpacked) makes an
     // oversized block: compress it on several threads.
-    let encoded = if job.oversized && prefix.is_empty() && !job.x86 {
+    let encoded = if cm && compressible && !job.oversized && input.len() <= crate::cm::MAX_BLOCK {
+        // Ultra: context mixing for everything that compresses.
+        codec::encode_cm(input, job.x86)
+    } else if job.oversized && prefix.is_empty() && !job.x86 {
         codec::encode_chunked(method, input, 4 << 20)?
     } else {
         codec::encode(method, input, prefix, job.x86)?

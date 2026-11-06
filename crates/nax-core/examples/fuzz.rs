@@ -91,11 +91,12 @@ fn main() {
     let kdf = KdfParams { m_kib: 64, t: 1, p: 1 };
 
     let mut seeds: Vec<(Vec<u8>, Option<&str>)> = Vec::new();
-    let variants: [(&str, CreateOptions, Option<&str>); 4] = [
+    let variants: [(&str, CreateOptions, Option<&str>); 5] = [
         ("plain", CreateOptions { preset: Preset::Fast, block_size: Some(16 << 10), ..Default::default() }, None),
         ("max", CreateOptions { preset: Preset::Max, block_size: Some(32 << 10), ..Default::default() }, None),
         ("locked", CreateOptions { preset: Preset::Fast, password: Some("pw".into()), kdf: Some(kdf), block_size: Some(16 << 10), ..Default::default() }, Some("pw")),
         ("protected", CreateOptions { preset: Preset::Fast, recovery_percent: 10.0, block_size: Some(16 << 10), ..Default::default() }, None),
+        ("ultra", CreateOptions { preset: Preset::Ultra, block_size: Some(16 << 10), ..Default::default() }, None),
     ];
     for (name, o, pw) in variants {
         let p = seeds_dir.join(format!("{name}.nax"));
@@ -141,6 +142,17 @@ fn main() {
             let b2 = bytes.clone();
             catch_unwind(move || {
                 let _ = Index::decode(&b2, 16, data_end);
+            })
+            .map_err(|_| bytes)
+        } else if r.below(2) == 0 {
+            // The context-mixing decoder on garbage (no checksum in front of it).
+            let n = r.below(4096);
+            let bytes: Vec<u8> = (0..n).map(|_| r.next() as u8).collect();
+            let props = [1u8, (r.next() & 1) as u8, 16];
+            let size = r.below(32 << 10);
+            let b2 = bytes.clone();
+            catch_unwind(move || {
+                let _ = nax_core::cm::lab_decode(&props, &b2, size);
             })
             .map_err(|_| bytes)
         } else {

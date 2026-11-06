@@ -15,6 +15,7 @@ pub const STEP_ZSTD: u8 = 1;
 pub const STEP_LZMA2: u8 = 2;
 pub const STEP_LDM: u8 = 3;
 pub const STEP_RECOMP: u8 = 4;
+pub const STEP_CM: u8 = 5;
 
 // Sanity limits so a malicious index can't make us allocate absurd amounts.
 const MAX_PATH_LEN: usize = 32 * 1024;
@@ -121,6 +122,7 @@ impl BlockInfo {
             None => "store",
             Some(STEP_ZSTD) => "zstd",
             Some(STEP_LZMA2) => "lzma2",
+            Some(STEP_CM) => "cm",
             Some(_) => "unknown",
         }
     }
