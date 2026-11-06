@@ -15,10 +15,28 @@ use nax_core::{Archive, CreateOptions, ExtractOptions, Overwrite, Phase, Preset,
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod shell;
+mod zipread;
+
 type CmdResult<T> = Result<T, String>;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// Arguments from other copies of the app that arrived before the window was
+/// listening (Explorer starts one copy per selected file, all at once).
+#[derive(Default)]
+struct Forwarded {
+    ready: bool,
+    early: Vec<Vec<String>>,
+}
+
+#[tauri::command]
+fn take_forwarded_args(state: State<Mutex<Forwarded>>) -> Vec<Vec<String>> {
+    let mut f = state.lock().unwrap();
+    f.ready = true;
+    std::mem::take(&mut f.early)
 }
 
 #[derive(Default)]
@@ -47,25 +65,50 @@ fn core_info() -> CoreInfo {
     }
 }
 
-/// Paths given on the command line (e.g. double-clicked `.nax`).
-#[tauri::command]
-fn startup_paths() -> Vec<String> {
-    std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .map(|p| std::path::absolute(&p).unwrap_or(p).to_string_lossy().into_owned())
+/// Command-line arguments: `--flags` as they are, paths made absolute.
+/// (Explorer's right-click menu starts the app with e.g. `--extract-here "file.nax"`.)
+fn normalize_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<String> {
+    args.into_iter()
+        .map(|a| {
+            if a.starts_with("--") {
+                a
+            } else {
+                let p = PathBuf::from(&a);
+                let p = if p.is_absolute() { p } else { cwd.join(p) };
+                std::path::absolute(&p).unwrap_or(p).to_string_lossy().into_owned()
+            }
+        })
         .collect()
 }
 
-/// True if the file starts with the `.nax` magic.
+#[tauri::command]
+fn startup_args() -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    normalize_args(std::env::args().skip(1), &cwd)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Nax,
+    Zip,
+}
+
+fn archive_kind(path: &Path) -> Option<Kind> {
+    let mut buf = [0u8; 4];
+    fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf)).ok()?;
+    if nax_core::is_nax(&buf) {
+        Some(Kind::Nax)
+    } else if zipread::is_zip(&buf) {
+        Some(Kind::Zip)
+    } else {
+        None
+    }
+}
+
+/// True for archives Nanarchive can open (.nax and ZIP).
 #[tauri::command]
 fn is_archive(path: String) -> bool {
-    let mut buf = [0u8; 4];
-    fs::File::open(&path)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-        .map(|_| nax_core::is_nax(&buf))
-        .unwrap_or(false)
+    archive_kind(Path::new(&path)).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +236,7 @@ struct EstimateView {
     dirs: u64,
     bytes: u64,
     sizes: [u64; 5],
+    seconds: [f64; 5],
 }
 
 #[tauri::command]
@@ -201,7 +245,7 @@ async fn estimate(inputs: Vec<String>) -> CmdResult<EstimateView> {
     let e = tauri::async_runtime::spawn_blocking(move || nax_core::estimate(&inputs))
         .await
         .map_err(err)?;
-    Ok(EstimateView { files: e.files, dirs: e.dirs, bytes: e.bytes, sizes: e.sizes })
+    Ok(EstimateView { files: e.files, dirs: e.dirs, bytes: e.bytes, sizes: e.sizes, seconds: e.seconds })
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +263,8 @@ struct ArchiveView {
     dirs: u64,
     blocks: u64,
     methods: Vec<&'static str>,
+    /// "nax" or "zip".
+    format: &'static str,
     paths: Vec<String>,
     sizes: Vec<u64>,
     is_dir: Vec<bool>,
@@ -230,6 +276,32 @@ struct ArchiveView {
 async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
     let p = PathBuf::from(&path);
     let view = tauri::async_runtime::spawn_blocking(move || -> CmdResult<ArchiveView> {
+        if archive_kind(&p) == Some(Kind::Zip) {
+            let z = zipread::list(&p)?;
+            let n = z.entries.len();
+            let mut v = ArchiveView {
+                path: p.to_string_lossy().into_owned(),
+                name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                archive_size: z.archive_size,
+                total_size: z.entries.iter().map(|e| e.size).sum(),
+                files: z.entries.iter().filter(|e| !e.is_dir).count() as u64,
+                dirs: z.entries.iter().filter(|e| e.is_dir).count() as u64,
+                blocks: 0,
+                methods: vec!["zip"],
+                format: "zip",
+                paths: Vec::with_capacity(n),
+                sizes: Vec::with_capacity(n),
+                is_dir: Vec::with_capacity(n),
+                mtimes: Vec::with_capacity(n),
+            };
+            for e in z.entries {
+                v.paths.push(e.path);
+                v.sizes.push(e.size);
+                v.is_dir.push(e.is_dir);
+                v.mtimes.push(e.mtime_ms);
+            }
+            return Ok(v);
+        }
         let a = Archive::open(&p).map_err(err)?;
         let entries = a.entries();
         let n = entries.len();
@@ -242,6 +314,7 @@ async fn open_archive(app: AppHandle, path: String) -> CmdResult<ArchiveView> {
             dirs: entries.iter().filter(|e| e.is_dir()).count() as u64,
             blocks: a.blocks().len() as u64,
             methods: a.methods(),
+            format: "nax",
             paths: Vec::with_capacity(n),
             sizes: Vec::with_capacity(n),
             is_dir: Vec::with_capacity(n),
@@ -427,6 +500,15 @@ fn start_job(
     });
 }
 
+/// ZIP reader errors as core errors (so cancelling looks the same).
+fn zip_err(e: String) -> nax_core::Error {
+    if e == "cancelled" {
+        nax_core::Error::Cancelled
+    } else {
+        nax_core::Error::InvalidInput(e)
+    }
+}
+
 fn preset_from(name: &str) -> CmdResult<Preset> {
     name.parse::<Preset>().map_err(err)
 }
@@ -476,6 +558,12 @@ fn extract_archive(
     overwrite: bool,
 ) -> CmdResult<()> {
     start_job(app, &jobs, job, move |progress, cancel| {
+        let path = PathBuf::from(&archive);
+        if archive_kind(&path) == Some(Kind::Zip) {
+            let s = zipread::run(&path, Some((Path::new(&dest), overwrite)), &only, &cancel, progress).map_err(zip_err)?;
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            return Ok(DoneEvent { output: dest, files: s.files, bytes_in: size, bytes_out: s.bytes, skipped: s.skipped, ..Default::default() });
+        }
         let a = Archive::open(&archive)?;
         let opts = ExtractOptions {
             overwrite: if overwrite { Overwrite::Replace } else { Overwrite::Skip },
@@ -499,6 +587,12 @@ fn extract_archive(
 #[tauri::command]
 fn test_archive(app: AppHandle, jobs: State<Jobs>, job: u64, archive: String) -> CmdResult<()> {
     start_job(app, &jobs, job, move |progress, cancel| {
+        let path = PathBuf::from(&archive);
+        if archive_kind(&path) == Some(Kind::Zip) {
+            let s = zipread::run(&path, None, &[], &cancel, progress).map_err(zip_err)?;
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            return Ok(DoneEvent { output: archive, files: s.files, bytes_in: size, bytes_out: s.bytes, ..Default::default() });
+        }
         let a = Archive::open(&archive)?;
         let s = a.test(None, Some(&cancel), progress)?;
         Ok(DoneEvent {
@@ -553,25 +647,35 @@ fn image_mime(ext: &str) -> Option<&'static str> {
 #[tauri::command]
 async fn preview(archive: String, entry: String) -> CmdResult<PreviewView> {
     tauri::async_runtime::spawn_blocking(move || -> CmdResult<PreviewView> {
-        let a = Archive::open(&archive).map_err(err)?;
-        let e = a.entries().iter().find(|e| e.path == entry).ok_or("file not found in archive")?;
-        let size = e.size;
         let ext = Path::new(&entry).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
         let mime = image_mime(&ext);
         let none = |size| PreviewView { kind: "none", mime: String::new(), data: String::new(), truncated: false, size };
-        if e.is_dir() || size > PREVIEW_MAX {
-            return Ok(none(size));
-        }
+        let path = PathBuf::from(&archive);
 
-        let tmp = std::env::temp_dir().join(format!("nanarchive-preview-{}-{}", std::process::id(), now_ms()));
-        let opts = ExtractOptions { overwrite: Overwrite::Replace, only: vec![entry.clone()], ..Default::default() };
-        let res = a.extract(&tmp, &opts, &mut |_| {});
-        let bytes = res.map_err(err).and_then(|_| {
-            let file = nax_core::paths::safe_join(&tmp, &entry).map_err(err)?;
-            fs::read(file).map_err(err)
-        });
-        let _ = fs::remove_dir_all(&tmp);
-        let bytes = bytes?;
+        let (bytes, size) = if archive_kind(&path) == Some(Kind::Zip) {
+            let bytes = zipread::read(&path, &entry, PREVIEW_MAX + 1)?;
+            if bytes.len() as u64 > PREVIEW_MAX {
+                return Ok(none(bytes.len() as u64));
+            }
+            let n = bytes.len() as u64;
+            (bytes, n)
+        } else {
+            let a = Archive::open(&archive).map_err(err)?;
+            let e = a.entries().iter().find(|e| e.path == entry).ok_or("file not found in archive")?;
+            let size = e.size;
+            if e.is_dir() || size > PREVIEW_MAX {
+                return Ok(none(size));
+            }
+            let tmp = std::env::temp_dir().join(format!("nanarchive-preview-{}-{}", std::process::id(), now_ms()));
+            let opts = ExtractOptions { overwrite: Overwrite::Replace, only: vec![entry.clone()], ..Default::default() };
+            let res = a.extract(&tmp, &opts, &mut |_| {});
+            let bytes = res.map_err(err).and_then(|_| {
+                let file = nax_core::paths::safe_join(&tmp, &entry).map_err(err)?;
+                fs::read(file).map_err(err)
+            });
+            let _ = fs::remove_dir_all(&tmp);
+            (bytes?, size)
+        };
 
         if let Some(m) = mime {
             return Ok(PreviewView {
@@ -605,16 +709,88 @@ async fn preview(archive: String, entry: String) -> CmdResult<PreviewView> {
 }
 
 // ---------------------------------------------------------------------------
+// Explorer integration and quick actions
+
+#[tauri::command]
+fn shell_status() -> shell::Status {
+    shell::status()
+}
+
+#[tauri::command]
+fn shell_register(labels: shell::Labels) -> CmdResult<()> {
+    shell::register(&labels).map_err(err)
+}
+
+#[tauri::command]
+fn shell_unregister() -> CmdResult<()> {
+    shell::unregister().map_err(err)
+}
+
+/// Flags Explorer's menu passes for actions that run without the full window.
+const QUICK_FLAGS: &[&str] = &["--add", "--add-quick", "--extract-here", "--extract-to", "--test"];
+
+fn is_quick(args: &[String]) -> bool {
+    args.iter().any(|a| QUICK_FLAGS.contains(&a.as_str()))
+}
+
+/// Small window for quick actions, or the normal file manager size.
+fn window_mode(w: &tauri::WebviewWindow, quick: bool, add: bool) {
+    use tauri::LogicalSize;
+    if quick {
+        let _ = w.set_min_size(Some(LogicalSize::new(420.0, 360.0)));
+        let _ = w.set_size(if add { LogicalSize::new(640.0, 620.0) } else { LogicalSize::new(480.0, 470.0) });
+    } else {
+        let _ = w.set_min_size(Some(LogicalSize::new(760.0, 520.0)));
+        let _ = w.set_size(LogicalSize::new(1100.0, 720.0));
+    }
+    let _ = w.center();
+}
+
+#[tauri::command]
+fn set_window_mode(app: AppHandle, quick: bool, add: bool) {
+    if let Some(w) = app.get_webview_window("main") {
+        window_mode(&w, quick, add);
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Explorer starts one process per selected file; they all hand their
+        // arguments to the first one, which merges them into one job.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let args = normalize_args(argv.into_iter().skip(1), Path::new(&cwd));
+            if !is_quick(&args) {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+            let state = app.state::<Mutex<Forwarded>>();
+            let mut f = state.lock().unwrap();
+            if f.ready {
+                let _ = app.emit("args", args);
+            } else {
+                f.early.push(args);
+            }
+        }))
+        .setup(|app| {
+            if let Some(w) = app.get_webview_window("main") {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                if is_quick(&args) {
+                    window_mode(&w, true, args.iter().any(|a| a == "--add"));
+                }
+                let _ = w.show();
+            }
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Jobs::default())
+        .manage(Mutex::new(Forwarded::default()))
         .invoke_handler(tauri::generate_handler![
             core_info,
-            startup_paths,
+            startup_args,
             is_archive,
             list_dir,
             home_dir,
@@ -629,6 +805,11 @@ pub fn run() {
             test_archive,
             cancel_job,
             preview,
+            shell_status,
+            shell_register,
+            shell_unregister,
+            set_window_mode,
+            take_forwarded_args,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nanarchive");

@@ -3,6 +3,19 @@
   import { PRESETS, type CoreInfo } from "./api";
   import { ACCENTS, saveSettings, settings, type Accent, type LangSetting, type Theme } from "./state.svelte";
   import { t, type Key } from "./i18n.svelte";
+  import { syncExplorer } from "./explorer";
+  import { toast } from "./state.svelte";
+
+  async function toggleExplorer() {
+    const on = !settings.explorer;
+    try {
+      await syncExplorer(on);
+      settings.explorer = on;
+      toast(on ? t("set.explorerOn") : t("set.explorerOff"), "ok");
+    } catch (e) {
+      toast(String(e), "error", 6000);
+    }
+  }
 
   let { info, onclose }: { info: CoreInfo | null; onclose: () => void } = $props();
 
@@ -64,6 +77,12 @@
   <div class="item">
     <div><b>{t("set.motion")}</b><p class="muted">{t("set.motionDesc")}</p></div>
     <button class="switch" class:on={settings.motion} onclick={() => (settings.motion = !settings.motion)} aria-label={t("set.motion")}>
+      <span></span>
+    </button>
+  </div>
+  <div class="item">
+    <div><b>{t("set.explorer")}</b><p class="muted">{t("set.explorerDesc")}</p></div>
+    <button class="switch" class:on={settings.explorer} onclick={toggleExplorer} aria-label={t("set.explorer")}>
       <span></span>
     </button>
   </div>

@@ -13,9 +13,9 @@ export const ACCENTS = {
 export type Accent = keyof typeof ACCENTS;
 
 export type LangSetting = "auto" | "en" | "ru";
-type Saved = { theme: Theme; accent: Accent; preset: Preset; motion: boolean; labels: boolean; lastDir: string; lang: LangSetting };
+type Saved = { theme: Theme; accent: Accent; preset: Preset; motion: boolean; labels: boolean; lastDir: string; lang: LangSetting; explorer: boolean };
 const KEY = "nanarchive.settings";
-const defaults: Saved = { theme: "system", accent: "lavender", preset: "balanced", motion: true, labels: true, lastDir: "", lang: "auto" };
+const defaults: Saved = { theme: "system", accent: "lavender", preset: "balanced", motion: true, labels: true, lastDir: "", lang: "auto", explorer: true };
 
 function load(): Saved {
   try {

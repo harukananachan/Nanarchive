@@ -18,6 +18,21 @@ pub struct Estimate {
     pub bytes: u64,
     /// Estimated archive size for each preset, in [`Preset::ALL`] order.
     pub sizes: [u64; 5],
+    /// Estimated packing time in seconds for each preset.
+    pub seconds: [f64; 5],
+}
+
+/// Packing speed in MB/s per preset (Store, Fast, Balanced, Max, Ultra),
+/// measured on the benchmark corpus with 28 threads.
+fn speeds(g: Group) -> [f64; 5] {
+    match g {
+        Group::General => [600.0, 250.0, 33.0, 14.0, 4.3],
+        // Lossless JPEG re-encoding is the slow part on Max / Ultra.
+        Group::Jpeg => [600.0, 200.0, 19.0, 4.5, 2.3],
+        // Unpacking and re-checking deflate streams (PNG, ZIP, DOCX...).
+        Group::Deflated => [600.0, 200.0, 12.0, 3.5, 1.5],
+        Group::Media => [600.0, 300.0, 150.0, 150.0, 150.0],
+    }
 }
 
 const SAMPLE_FILES: usize = 96;
@@ -102,6 +117,17 @@ pub fn estimate(inputs: &[PathBuf]) -> Estimate {
         // Index and header: roughly 24 bytes per entry plus a fixed part.
         let overhead = 96 + (est.files + est.dirs) * 24;
         *size = total as u64 + overhead;
+    }
+
+    // Fewer cores than the benchmark machine means proportionally slower.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+    let scale = (threads / 28.0).clamp(0.08, 1.5);
+    for (i, secs) in est.seconds.iter_mut().enumerate() {
+        let mut t = 0.3;
+        for g in [Group::General, Group::Jpeg, Group::Deflated, Group::Media] {
+            t += per_group[g as usize] as f64 / 1_048_576.0 / (speeds(g)[i] * scale);
+        }
+        *secs = t;
     }
     est
 }

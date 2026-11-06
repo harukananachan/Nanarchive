@@ -12,7 +12,7 @@ export type CoreInfo = {
   threads: number;
 };
 
-export type Estimate = { files: number; dirs: number; bytes: number; sizes: number[] };
+export type Estimate = { files: number; dirs: number; bytes: number; sizes: number[]; seconds: number[] };
 
 export type ArchiveView = {
   path: string;
@@ -23,6 +23,7 @@ export type ArchiveView = {
   dirs: number;
   blocks: number;
   methods: string[];
+  format: "nax" | "zip";
   paths: string[];
   sizes: number[];
   is_dir: boolean[];
@@ -63,6 +64,18 @@ export type PreviewView = {
   size: number;
 };
 
+export type ShellLabels = {
+  file_type: string;
+  open: string;
+  extract_here: string;
+  extract_to: string;
+  test: string;
+  menu: string;
+  add: string;
+  add_quick: string;
+};
+export type ShellStatus = { registered: boolean; current: boolean };
+
 export type DirEntry = { name: string; is_dir: boolean; size: number; mtime: number; drive: boolean };
 export type DirView = { path: string; parent: string | null; entries: DirEntry[] };
 
@@ -78,7 +91,8 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 export const api = {
   coreInfo: () => call<CoreInfo>("core_info"),
-  startupPaths: () => call<string[]>("startup_paths"),
+  startupArgs: () => call<string[]>("startup_args"),
+  takeForwardedArgs: () => call<string[][]>("take_forwarded_args"),
   isArchive: (path: string) => call<boolean>("is_archive", { path }),
   listDir: (path: string) => call<DirView>("list_dir", { path }),
   homeDir: () => call<string>("home_dir"),
@@ -95,6 +109,10 @@ export const api = {
   testArchive: (job: number, archive: string) => call<void>("test_archive", { job, archive }),
   cancelJob: (job: number) => call<void>("cancel_job", { job }),
   preview: (archive: string, entry: string) => call<PreviewView>("preview", { archive, entry }),
+  shellStatus: () => call<ShellStatus>("shell_status"),
+  shellRegister: (labels: ShellLabels) => call<void>("shell_register", { labels }),
+  shellUnregister: () => call<void>("shell_unregister"),
+  setWindowMode: (quick: boolean, add: boolean) => call<void>("set_window_mode", { quick, add }),
 };
 
 // --- Events ----------------------------------------------------------------
@@ -152,7 +170,7 @@ export async function pickArchive(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const r = await open({
     title: "Open archive",
-    filters: [{ name: "Nanarchive", extensions: ["nax"] }],
+    filters: [{ name: "Archives", extensions: ["nax", "zip", "jar"] }],
   });
   return typeof r === "string" ? r : null;
 }
@@ -234,6 +252,7 @@ function mockArchive(path: string): ArchiveView {
     dirs: 4,
     blocks: 9,
     methods: ["lzma2", "recompress"],
+    format: /\.zip$/i.test(path) ? "zip" : "nax",
     paths,
     sizes,
     is_dir,
@@ -288,10 +307,18 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
   switch (cmd) {
     case "core_info":
       return { version: "0.1.0", extension: "nax", format_version: 1, presets: PRESETS, threads: 28 };
-    case "startup_paths":
+    case "startup_args":
+      return new URLSearchParams(location.search).getAll("arg");
+    case "take_forwarded_args":
       return [];
+    case "shell_status":
+      return { registered: true, current: true };
+    case "shell_register":
+    case "shell_unregister":
+    case "set_window_mode":
+      return;
     case "is_archive":
-      return String(a.path).toLowerCase().endsWith(".nax");
+      return /\.(nax|zip|jar)$/i.test(String(a.path));
     case "home_dir":
       return "C:\\Users\\demo";
     case "list_dir": {
@@ -313,10 +340,10 @@ async function mock(cmd: string, a: Record<string, any>): Promise<unknown> {
       return `${dir}\\${name}.nax`;
     }
     case "suggest_extract_dir":
-      return String(a.archive).replace(/\.nax$/i, "");
+      return String(a.archive).replace(/\.(nax|zip|jar)$/i, "");
     case "estimate": {
       const bytes = 152_000_000 * a.inputs.length;
-      return { files: 1244 * a.inputs.length, dirs: 31, bytes, sizes: [1.0, 0.31, 0.215, 0.205, 0.196].map((f) => Math.round(bytes * f)) };
+      return { files: 1244 * a.inputs.length, dirs: 31, bytes, sizes: [1.0, 0.31, 0.215, 0.205, 0.196].map((f) => Math.round(bytes * f)), seconds: [0.5, 1, 5, 12, 38] };
     }
     case "open_archive":
       return mockArchive(a.path);

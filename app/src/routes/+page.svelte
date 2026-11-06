@@ -33,6 +33,7 @@
   import { buildTree, type Node } from "$lib/tree";
   import { ACCENTS, newJob, saveSettings, settings, toast } from "$lib/state.svelte";
   import { lang, t } from "$lib/i18n.svelte";
+  import { syncExplorer } from "$lib/explorer";
 
   // --- Where we are -----------------------------------------------------------
   type Loc =
@@ -47,8 +48,8 @@
   let info = $state<CoreInfo | null>(null);
   let recent = $state<Recent[]>([]);
   let hovering = $state(false);
-  let list: FileList;
-  let findEl: HTMLInputElement;
+  let list = $state<FileList>();
+  let findEl = $state<HTMLInputElement>();
 
   // --- Dialogs ----------------------------------------------------------------
   let addFor = $state<string[] | null>(null);
@@ -60,7 +61,9 @@
 
   type Job = { id: number; kind: JobKind; title: string; progress: ProgressEvent | null; done: DoneEvent | null };
   let job = $state<Job | null>(null);
-  const blocked = $derived(!!(addFor || extractFor || infoFor || settingsOpen || previewing || job));
+  /** A queued action is getting ready (e.g. picking a folder name). */
+  let starting = $state(false);
+  const blocked = $derived(!!(addFor || extractFor || infoFor || settingsOpen || previewing || job || starting));
 
   // --- Theme ------------------------------------------------------------------
   $effect(() => {
@@ -75,6 +78,8 @@
   // --- Paths ------------------------------------------------------------------
   const join = (dir: string, name: string) => (dir.endsWith("\\") || dir.endsWith("/") ? dir + name : `${dir}\\${name}`);
   const isNaxName = (p: string) => ext(p) === "nax";
+  /** Archives Nanarchive opens itself (.docx and friends are ZIPs too, but open in their own apps). */
+  const isArcName = (p: string) => ["nax", "zip", "jar"].includes(ext(p));
 
   function typeOf(name: string): { icon: string; type: string } {
     if (isNaxName(name)) return { icon: "nax", type: t("type.nax") };
@@ -160,7 +165,7 @@
   async function goAddress() {
     const a = addr.trim().replace(/^"|"$/g, "");
     if (!a || a === t("thisPc")) return gotoDisk("");
-    const m = a.match(/^(.*?\.nax)(?:[\\/](.*))?$/i);
+    const m = a.match(/^(.*?\.(?:nax|zip|jar))(?:[\\/](.*))?$/i);
     if (m && (await api.isArchive(m[1]))) return openArchive(m[1], (m[2] ?? "").replaceAll("\\", "/").replace(/\/$/, ""));
     gotoDisk(a);
   }
@@ -206,14 +211,14 @@
 
   const nodeOf = (key: string) => (loc?.kind === "arc" && key.startsWith("n") ? loc.nodes[Number(key.slice(1))] : null);
   const selRows = $derived(rows.filter((r) => selected.has(r.key)));
-  const selNax = $derived(loc?.kind === "disk" ? selRows.find((r) => !r.dir && isNaxName(r.name)) : undefined);
+  const selNax = $derived(loc?.kind === "disk" ? selRows.find((r) => !r.dir && isArcName(r.name)) : undefined);
 
   function activate(r: Row) {
     if (r.icon === "up") return up();
     if (!loc) return;
     if (loc.kind === "disk") {
       if (r.dir) gotoDisk(r.key);
-      else if (isNaxName(r.name)) openArchive(r.key);
+      else if (isArcName(r.name)) openArchive(r.key);
       else openWithSystem(r.key).catch((e) => toast(String(e), "error"));
     } else {
       const n = nodeOf(r.key);
@@ -326,7 +331,101 @@
   async function openResult() {
     const out = job?.done?.output;
     job = null;
+    if (quick) await leaveQuick();
     if (out) await openArchive(out);
+  }
+
+  // --- Quick actions (Explorer's right-click menu) ---------------------------
+  // Explorer starts the app once per selected file, e.g. `--extract-here a.nax`.
+  // Later copies hand their arguments to this one ("args" event); arguments
+  // that arrive within a moment of each other are merged into one action.
+  const QUICK = ["--add", "--add-quick", "--extract-here", "--extract-to", "--test"];
+  /** Compact window that closes by itself when its work is done. */
+  let quick = $state(false);
+  let quickArmed = $state(false);
+  let later = $state<(() => void)[]>([]);
+  let gather: { flag: string; paths: string[] } | null = null;
+  let gatherTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function whenFree(fn: () => void) {
+    if (!blocked && !later.length) fn();
+    else later.push(fn);
+  }
+
+  // Run the next queued action once the window is free.
+  $effect(() => {
+    if (!blocked && later.length) later.shift()!();
+  });
+
+  // A quick window with nothing left to do closes.
+  $effect(() => {
+    if (quick && quickArmed && !blocked && !later.length && !busy) win.close();
+  });
+
+  function receiveArgs(args: string[]) {
+    const flag = args.find((a) => a.startsWith("--")) ?? "";
+    const paths = args.filter((a) => !a.startsWith("--"));
+    if (!paths.length) return;
+    if (gather && gather.flag !== flag) flushArgs();
+    gather ??= { flag, paths: [] };
+    gather.paths.push(...paths);
+    clearTimeout(gatherTimer);
+    gatherTimer = setTimeout(flushArgs, 350);
+  }
+
+  async function flushArgs() {
+    const g = gather;
+    gather = null;
+    clearTimeout(gatherTimer);
+    if (!g) return;
+    const paths = [...new Set(g.paths)];
+    try {
+      switch (g.flag) {
+        case "--add":
+          whenFree(() => (addFor = paths));
+          break;
+        case "--add-quick": {
+          const dest = await api.suggestArchivePath(paths);
+          const preset = settings.preset;
+          whenFree(() => startJob("create", baseName(dest), (id) => api.createArchive(id, dest, paths, preset, false)));
+          break;
+        }
+        case "--extract-here":
+        case "--extract-to":
+          for (const p of paths) {
+            // The folder name is picked when the job starts, so two "photos" archives get "photos" and "photos (2)".
+            whenFree(async () => {
+              starting = true;
+              try {
+                const dest = g.flag === "--extract-here" ? dirName(p) : await api.suggestExtractDir(p);
+                startJob("extract", `${baseName(p)} → ${dest}`, (id) => api.extractArchive(id, p, dest, [], false));
+              } catch (e) {
+                toast(String(e), "error", 6000);
+              } finally {
+                starting = false;
+              }
+            });
+          }
+          break;
+        case "--test":
+          for (const p of paths) whenFree(() => startJob("test", baseName(p), (id) => api.testArchive(id, p)));
+          break;
+        default:
+          if (quick) await leaveQuick();
+          if (paths.length === 1 && (await api.isArchive(paths[0]))) whenFree(() => openArchive(paths[0]));
+          else whenFree(() => (addFor = paths));
+      }
+    } catch (e) {
+      toast(String(e), "error", 6000);
+    }
+    quickArmed = true;
+  }
+
+  /** Grows the quick window into the normal file manager. */
+  async function leaveQuick() {
+    quick = false;
+    await api.setWindowMode(false, false);
+    if (!loc) await gotoDisk(settings.lastDir || (await api.homeDir()));
   }
 
   // --- Menus ------------------------------------------------------------------
@@ -432,25 +531,38 @@
           if (job && job.id === p.job && !job.done) job.progress = p;
         }),
         await listen<DoneEvent>("job-done", (d) => {
-          if (job && job.id === d.job) job.done = d;
+          if (!job || job.id !== d.job) return;
+          job.done = d;
+          // In the quick window a clean success just goes away, like WinRAR.
+          if (quick && d.ok && !d.warnings.length && !d.skipped) setTimeout(() => job?.id === d.job && closeJob(), 700);
         }),
+        await listen<string[]>("args", receiveArgs),
         await onFileDrop(handlePaths, (h) => (hovering = h)),
       );
       try {
         info = await api.coreInfo();
         refreshRecent();
-        const start = await api.startupPaths();
-        if (start.length === 1 && (await api.isArchive(start[0]))) await openArchive(start[0]);
+        const args = await api.startupArgs();
+        quick = args.some((a) => QUICK.includes(a));
+        if (quick) receiveArgs(args);
+        else if (args.length === 1 && (await api.isArchive(args[0]))) await openArchive(args[0]);
         else {
           await gotoDisk(settings.lastDir || (await api.homeDir()));
           if (loc === null) await gotoDisk(await api.homeDir());
-          if (start.length) addFor = start;
+          receiveArgs(args);
         }
+        for (const a of await api.takeForwardedArgs()) receiveArgs(a);
       } catch (e) {
         toast(String(e), "error");
       }
     })();
     return () => offs.forEach((f) => f());
+  });
+
+  // Keep the Explorer menu pointing at this exe and in the current language.
+  $effect(() => {
+    lang();
+    if (info && settings.explorer && !quick) syncExplorer(true).catch(() => {});
   });
 
   const title = $derived(loc?.kind === "arc" ? loc.archive.name : loc?.kind === "disk" ? baseName(loc.dir.path) || t("thisPc") : "");
@@ -468,19 +580,20 @@
 
 <svelte:window onkeydown={key} onmousedown={(e) => ctx && !(e.target as HTMLElement).closest(".ctx") && (ctx = null)} />
 
-<div class="app">
+<div class="app" class:quick>
   <!-- Title bar with menus -->
   <header class="titlebar" data-tauri-drag-region>
     <img class="logo" src="/logo.svg" alt="" width="20" height="20" />
-    <MenuBar {menus} />
+    {#if !quick}<MenuBar {menus} />{/if}
     <div class="title ellipsis" data-tauri-drag-region>{title ? `${title} — Nanarchive` : "Nanarchive"}</div>
     <div class="win">
       <button onclick={win.minimize} aria-label="Minimize"><Icon name="min" size={15} /></button>
-      <button onclick={win.toggleMaximize} aria-label="Maximize"><Icon name="max" size={13} /></button>
+      {#if !quick}<button onclick={win.toggleMaximize} aria-label="Maximize"><Icon name="max" size={13} /></button>{/if}
       <button class="close" onclick={win.close} aria-label="Close"><Icon name="x" size={15} /></button>
     </div>
   </header>
 
+  {#if !quick}
   <!-- Big toolbar -->
   <div class="toolbar" class:nolabels={!settings.labels}>
     <button class="tb" onclick={() => cmdAdd()} disabled={!can.add} title={can.add ? t("tip.add") : t("tip.addOff")}>
@@ -569,6 +682,8 @@
     {/if}
   </footer>
 
+  {/if}
+
   {#if ctx}
     <div class="ctx" style="left:{ctx.x}px; top:{ctx.y}px" role="menu">
       {#each ctx.items as it}
@@ -622,6 +737,12 @@
     flex-direction: column;
   }
 
+  /* Quick window: just the title bar and the dialog filling the rest. */
+  .app.quick :global(.scrim) {
+    top: 40px;
+    background: var(--bg);
+    backdrop-filter: none;
+  }
   .titlebar {
     height: 40px;
     flex-shrink: 0;

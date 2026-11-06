@@ -1,4 +1,4 @@
-﻿# Nanarchive — Master Plan
+# Nanarchive — Master Plan
 
 > Nanarchive (nana + archive): an archiver that aims to compress smaller than 7-Zip / RAR / ZIP
 > and feel nicer to use — fast, light, with a modern soft rounded UI.
@@ -144,6 +144,11 @@ keep/replace), Archive information, Settings (theme, accent, labels, animations,
 preview of images/text inside an archive, progress ring with speed / time left / "saved X MB".
 Virtual list (100,000+ rows), drag & drop, right-click menu, keyboard shortcuts (Alt+A/E/T/V/I,
 Ctrl+O/F/A, F5, Backspace, Enter, type-to-jump). `npm run dev` in a plain browser uses mock data.
+Pulled forward from Phase 7 (user request): Explorer right-click menu and .nax icon (HKCU only,
+toggle in Settings), quick actions that run in a small window and close when done (`--add`,
+`--add-quick`, `--extract-here`, `--extract-to`, `--test`; one instance merges the files Explorer
+sends), opening ZIP / JAR (browse, preview, extract, test). Time estimate uses measured speeds per
+file type (JPEG and PNG/ZIP recompression are much slower than plain data on Max / Ultra).
 
 **Phase 5 — Security & robustness**
 Encryption, recovery records, split volumes, fuzz testing the reader, path-safety checks.
@@ -159,7 +164,7 @@ corpus — not only photos/docs, but also text, source code, logs, executables a
 ✅ Done when: the benchmark shows Ultra smaller than both 7z and WinRAR in every category.
 
 **Phase 7 — Windows integration & release**
-Explorer context menu, file association + icon, opening ZIP/7z/RAR (extract only),
+Opening 7z / RAR (extract only) — ZIP and the Explorer menu are already done in Phase 4,
 installer (MSI/NSIS via Tauri), auto-update.
 
 ---

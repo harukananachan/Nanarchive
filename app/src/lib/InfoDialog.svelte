@@ -29,8 +29,8 @@
     <dt>{t("info.original")}</dt><dd>{bytes(archive.total_size, 2)} <span class="muted">({t("info.bytes", { n: count(archive.total_size) })})</span></dd>
     <dt>{t("info.archive")}</dt><dd>{bytes(archive.archive_size, 2)} <span class="muted">({t("info.bytes", { n: count(archive.archive_size) })})</span></dd>
     <dt>{t("info.methods")}</dt><dd>{archive.methods.join(", ")}</dd>
-    <dt>{t("info.blocks")}</dt><dd>{count(archive.blocks)}</dd>
-    <dt>{t("info.format")}</dt><dd>{t("info.formatText")}</dd>
+    {#if archive.format === "nax"}<dt>{t("info.blocks")}</dt><dd>{count(archive.blocks)}</dd>{/if}
+    <dt>{t("info.format")}</dt><dd>{archive.format === "zip" ? t("info.formatZip") : t("info.formatText")}</dd>
   </dl>
 
   {#snippet footer()}

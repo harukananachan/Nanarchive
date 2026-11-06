@@ -18,8 +18,6 @@
     onclose: () => void;
   } = $props();
 
-  // Pack speed (MB/s) measured on the benchmark with 28 threads.
-  const SPEED: Record<Preset, number> = { store: 900, fast: 220, balanced: 30, max: 13, ultra: 4.5 };
 
   let preset = $state<Preset>(settings.preset);
   let dest = $state("");
@@ -35,8 +33,7 @@
   const idx = $derived(PRESETS.indexOf(preset));
   const size = $derived(est ? est.sizes[idx] : 0);
   const saved = $derived(est && est.bytes > 0 ? Math.max(0, 1 - size / est.bytes) : 0);
-  // Benchmark speeds were measured on 28 threads; scale for this PC.
-  const seconds = $derived(est ? est.bytes / 1048576 / (SPEED[preset] * Math.min(1, Math.max(0.15, threads / 28))) : 0);
+  const seconds = $derived(est ? est.seconds[idx] : 0);
 
   async function browse() {
     const p = await pickSavePath(dest);
