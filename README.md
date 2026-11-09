@@ -3,9 +3,9 @@
 <h1 align="center">Nanarchive</h1>
 
 <p align="center"><b>A Windows archiver that makes smaller archives than 7-Zip and WinRAR.</b><br>
-Own archive format <code>.nax</code> · English and Russian · free and open source (MIT)</p>
+Own archive format <code>.nax</code> · English and Russian · public domain (Unlicense)</p>
 
-> **Made by Claude Opus 5.5**, an AI model by Anthropic. All code, tests and documents in this
+> **Vibecoded with Claude Opus 5.5**, an AI model by Anthropic. All code, tests and documents in this
 > project were written by Claude Opus 5.5 in Claude Code.
 
 ## What is Nanarchive?
@@ -113,4 +113,4 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). RAR archives are opened with the UnRAR library, which may only be used to extract RAR files, never to create them.
+Public domain ([Unlicense](LICENSE)): use, change, share or sell the code for anything, no credit needed. RAR archives are opened with the UnRAR library, which may only be used to extract RAR files, never to create them.
