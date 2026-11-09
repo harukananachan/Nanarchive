@@ -5,6 +5,9 @@
 <p align="center"><b>A Windows archiver that makes smaller archives than 7-Zip and WinRAR.</b><br>
 Own archive format <code>.nax</code> · English and Russian · free and open source (MIT)</p>
 
+> **Made by Claude Opus 5.5**, an AI model by Anthropic. All code, tests and documents in this
+> project were written by Claude Opus 5.5 in Claude Code.
+
 ## What is Nanarchive?
 
 Nanarchive packs files and folders into one smaller file, like WinRAR or 7-Zip, but it tries
