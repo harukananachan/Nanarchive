@@ -58,7 +58,8 @@ fed the archive reader about 740,000 damaged archives with no crash. Run the tes
 
 ## Download
 
-Build it yourself (see below). The installer is made by `scriptsuild-installer.ps1`.
+Get it from **[Releases](https://github.com/harukananachan/Nanarchive/releases/latest)**: the
+**setup** installer, or the **portable** ZIP (unzip and run, nothing to install). Windows 10/11, 64-bit.
 
 ## Project layout
 
