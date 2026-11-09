@@ -99,18 +99,6 @@ nax repair backup.nax                   # fix damage using the recovery record
 
 The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 
-## Status
-
-- Phase 0 (setup) — done
-- Phase 1 (`.nax` format, engine, CLI) — done
-- Phase 2 (benchmark + speed engine) — done; run `python -I bench\bench.py`, results in `bench/results/`
-- Phase 3 (JPEG/PNG/ZIP recompression, dedup, file-type sorting, Max tuning) — done
-- Phase 4 (desktop app: WinRAR-style file manager, English + Russian, Explorer right-click menu and .nax icon, opens ZIP) — done
-- Phase 5 (AES-256 password encryption, recovery records + repair, split volumes, fuzzed and hardened reader) — done
-- Phase 6 (Ultra = own context-mixing codec: smaller than 7-Zip Ultra and WinRAR Best in every benchmark category; extracting Ultra is slow) — done
-- Phase 7 (opens 7z and RAR, Windows installer, signed auto-update from an address you choose) — done
-- Phase 8 (video: MPEG-1 .mpg recompressed losslessly, ~16% smaller than 7z; MPEG-2 next) — in progress
-
 ## License
 
 Public domain ([Unlicense](LICENSE)): use, change, share or sell the code for anything, no credit needed. RAR archives are opened with the UnRAR library, which may only be used to extract RAR files, never to create them.
