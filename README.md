@@ -1,7 +1,61 @@
-# Nanarchive
+<p align="center"><img src="app/static/logo.svg" width="96" alt=""></p>
 
-An archiver that aims to compress smaller than 7-Zip and WinRAR, with a fast, modern, soft rounded UI.
-Archive format: **`.nax`**. See [PLAN.md](PLAN.md) for the full plan and roadmap.
+<h1 align="center">Nanarchive</h1>
+
+<p align="center"><b>A Windows archiver that makes smaller archives than 7-Zip and WinRAR.</b><br>
+Own archive format <code>.nax</code> · English and Russian · free and open source (MIT)</p>
+
+## What is Nanarchive?
+
+Nanarchive packs files and folders into one smaller file, like WinRAR or 7-Zip, but it tries
+harder to make them small:
+
+- **Photos (JPEG)** are re-encoded without losing a single bit, about 20% smaller. Other
+  archivers save about 1% on photos.
+- **PNG, ZIP, DOCX, XLSX, PDF and other "already compressed" files** are unpacked inside the
+  archive, compressed properly, and rebuilt exactly when you extract.
+- **MPEG-1 video (.mpg)** is re-encoded without loss, about 16% smaller than 7-Zip.
+- **Text, source code and programs** use its own context-mixing compressor in Ultra mode.
+- **Duplicate files** are stored once.
+
+Every file comes back **bit for bit identical**. Nanarchive checks this while it packs.
+
+It also has:
+- a desktop app that looks and works like WinRAR (file manager, Add / Extract / Test / Info)
+- AES-256 passwords, recovery records with repair, and archives split into parts
+- opening ZIP, 7z and RAR archives
+- the Explorer right-click menu, and an installer with signed auto-updates
+
+## Test results
+
+The same files packed with each archiver at its strongest setting (smaller is better):
+
+| Test files | Nanarchive Ultra | 7-Zip Ultra | WinRAR Best |
+|---|---:|---:|---:|
+| JavaScript code | **14.43 MB** | 17.86 MB | 19.23 MB |
+| Rust code | **10.85 MB** | 13.85 MB | 17.38 MB |
+| HTML documents | **4.86 MB** | 5.49 MB | 6.42 MB |
+| Photos (JPEG) | **36.31 MB** | 45.58 MB | 45.75 MB |
+| PNG images | **26.62 MB** | 32.85 MB | 33.15 MB |
+| Programs (.exe, .dll) | **27.13 MB** | 29.04 MB | 34.79 MB |
+| ZIP files | **25.74 MB** | 34.00 MB | 35.29 MB |
+| **Total** | **145.94 MB** | 178.67 MB | 192.01 MB |
+| MPEG-1 video clip (22.87 MB) | **18.46 MB** | 21.99 MB | 22.20 MB |
+
+Overall that is **18% smaller than 7-Zip** and **24% smaller than WinRAR**.
+
+Trade-off: Ultra is slow, and extracting it takes as long as packing. The **Max** preset is much
+faster and still beats 7-Zip on photos, PNGs and ZIPs. Videos in modern formats (MP4/MKV with
+H.264/H.265) are already compressed as tightly as possible, so no archiver shrinks them much.
+
+**Quality checks.** There are 72 automatic tests. They check that files come back identical,
+that wrong passwords and damaged archives are refused cleanly, and that repair works. A fuzzer
+fed the archive reader about 740,000 damaged archives with no crash. Run the tests with
+`cargo test --workspace`.
+
+## Download
+
+Build it yourself (see below). The installer is made by `scriptsuild-installer.ps1`.
 
 ## Project layout
 
@@ -53,3 +107,7 @@ The format is documented in [docs/FORMAT.md](docs/FORMAT.md).
 - Phase 6 (Ultra = own context-mixing codec: smaller than 7-Zip Ultra and WinRAR Best in every benchmark category; extracting Ultra is slow) — done
 - Phase 7 (opens 7z and RAR, Windows installer, signed auto-update from an address you choose) — done
 - Phase 8 (video: MPEG-1 .mpg recompressed losslessly, ~16% smaller than 7z; MPEG-2 next) — in progress
+
+## License
+
+MIT, see [LICENSE](LICENSE). RAR archives are opened with the UnRAR library, which may only be used to extract RAR files, never to create them.
